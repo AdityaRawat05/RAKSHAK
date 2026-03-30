@@ -24,7 +24,43 @@
 
 The project follows a **Tiered Escalation System** designed to minimize false alarms while ensuring zero-latency response during critical threats.
 
-![Technical Flowchart](docs/assets/diagrams/system_flowchart_complete.png)
+```mermaid
+flowchart TD
+    A([Start]) --> B(User Opens App / Login)
+    B --> C[Home Dashboard]
+    
+    C --> D{Continuous Sensor Monitoring:\nMic, Accelerometer, GPS}
+    D --> E((AI Threat Detection System))
+    
+    E --> F{Threat Detected?}
+    F -- No --> D
+    F -- Yes --> G{Threat Level?}
+    
+    G -- Low --> H[Level 1: Check-In Notification]
+    H --> I{User Responds?}
+    I -- Safe --> D
+    I -- No Response --> J[Level 2: Alert Mode]
+    
+    G -- Medium --> J
+    J --> K(Notify Trusted Contacts:\nShare Live Location)
+    K --> L[Monitor Situation]
+    L --> M{Situation Worsens?}
+    
+    M -- No --> D
+    M -- Yes --> N[Level 3: Emergency Mode Activated]
+    
+    G -- High --> N
+    
+    N --> O(Send Alerts to Contacts)
+    N --> P(Notify Nearby Users)
+    N --> Q(Call Emergency Services)
+    N --> R(Record Audio/Video Evidence)
+    
+    O --> S([Help Arrives / User Safe])
+    P --> S
+    Q --> S
+    R --> S
+```
 
 1. **Level 1 (Low Threat)**: A silent "Check-in" notification is sent to the user to verify safety.
 2. **Level 2 (Medium Threat)**: Trusted contacts are notified of potential distress and live location sharing begins.
