@@ -114,20 +114,20 @@ A deep dive into the background services and ML processing layers.
 
 ```mermaid
 graph TD
-    Subgraph Mobile Application
+    subgraph Mobile Application
     A[Expo Environment / React Native] --> B[Sensor Services]
     B --> C[Audio / Motion Capture]
     C --> D[TFLite Inference Engine]
     end
     
-    Subgraph AI Fusion Logic
+    subgraph AI Fusion Logic
     D --> E[Voice Anomaly Score]
     D --> F[Motion Anomaly Score]
     E --> G{Score Fusion Engine}
     F --> G
     end
     
-    Subgraph Cloud Architecture
+    subgraph Cloud Architecture
     G -- High Threat Detected --> H[Django Orchestration Layer]
     H --> I[MongoDB Atlas: Alert Logging]
     H --> J[Daphne / Channels: Notification Dispatch]
