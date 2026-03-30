@@ -99,10 +99,12 @@ Explore the inner workings of project Rakshak:
 - [🚀 Installation Guide](docs/INSTALLATION_GUIDE.md) - Complete setup for Backend, Mobile, and Ngrok.
 - [☁️ MongoDB Atlas Setup](docs/ATLAS_SETUP.md) - Deploying the cloud database.
 - [🌐 Ngrok Tunneling Setup](docs/NGROK_SETUP.md) - Bridging the local connection.
+- [🔗 Connection Verification Report](docs/CONNECTION_VERIFICATION_REPORT.md) - Full system connectivity and API testing logs.
 - [📊 System Diagrams](docs/SYSTEM_DIAGRAMS.md) - Visualizing the logic and flows.
 - [💎 Implementation Quality](docs/IMPLEMENTATION_QUALITY.md) - Security, reliability, and edge-cases.
 - [⚙️ Technical Clarity](docs/TECHNICAL_CLARITY.md) - ML fusion and API architecture.
 - [📈 Scalability Approach](docs/SCALABILITY.md) - Handling growth and geospatial performance.
+- [🛠️ Environment variables template](.env.example) - Base configuration file.
 
 ---
 
