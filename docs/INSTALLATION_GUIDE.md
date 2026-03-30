@@ -9,8 +9,8 @@ This guide will walk you through setting up the complete **RAKSHAK** system on y
 Before you begin, ensure your system has the following installed:
 1. **Python 3.10+**: For configuring the Django backend and ML scripts.
 2. **Node.js (v18+) & npm**: For running the React Native mobile application.
-3. **MongoDB Atlas Account**: Required for the database (See [ATLAS_SETUP.md](../ATLAS_SETUP.md)).
-4. **Ngrok**: Required to expose your local backend to the mobile app (See [NGROK_SETUP.md](../NGROK_SETUP.md)).
+3. **MongoDB Atlas Account**: Required for the database (See [ATLAS_SETUP.md](ATLAS_SETUP.md)).
+4. **Ngrok**: Required to expose your local backend to the mobile app (See [NGROK_SETUP.md](NGROK_SETUP.md)).
 5. **Expo Go App**: Install this on your physical iOS or Android device from the App Store / Google Play Store to run the mobile client.
 
 ---
@@ -49,7 +49,7 @@ Copy the root `.env.example` file and configure it:
    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
    ```
 3. Paste that key into the `AES_ENCRYPTION_KEY` variable in `.env`.
-4. Follow the instructions in [ATLAS_SETUP.md](../ATLAS_SETUP.md) to set your `MONGODB_URI`.
+4. Follow the instructions in [ATLAS_SETUP.md](ATLAS_SETUP.md) to set your `MONGODB_URI`.
 
 ### 4. Run the Server
 Because we use MongoDB directly via PyMongo for alerts, there are no traditional Django migrations needed for the core logic, but we must start the server:
@@ -64,7 +64,7 @@ Your backend is now running at `http://127.0.0.1:8000`.
 
 Mobile devices cannot easily communicate with `localhost`. We will use Ngrok to expose the backend.
 
-1. Follow the instructions in [NGROK_SETUP.md](../NGROK_SETUP.md) to start your tunnel:
+1. Follow the instructions in [NGROK_SETUP.md](NGROK_SETUP.md) to start your tunnel:
    ```bash
    ngrok http 8000
    ```
