@@ -1,0 +1,30 @@
+# Node/Expo
+node_modules/
+.expo/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python/Django
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+ENV/
+.env
+.venv
+db.sqlite3
+media/
+*.log
+
+# IDEs and Tools
+.vscode/
+.idea/
+*.swp
+*.bak
+.DS_Store
+
+# AI/Local tooling
+.gemini/

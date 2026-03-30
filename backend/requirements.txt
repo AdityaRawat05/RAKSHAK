@@ -1,0 +1,12 @@
+django>=4.2
+djangorestframework
+djangorestframework-simplejwt[crypto]
+pymongo[srv]
+channels
+# channels-redis removed since we are using InMemoryChannelLayer for the single backend instance
+cryptography
+requests
+python-decouple
+django-cors-headers
+django-ratelimit
+bcrypt
