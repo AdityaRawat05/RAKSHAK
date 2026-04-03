@@ -376,7 +376,22 @@ class UploadEvidenceChunkView(APIView):
         )
 
         if lat and lng:
+            # 1. Update SQLite History
             IncidentLocation.objects.create(incident=incident, lat=lat, lng=lng)
+            
+            # 2. Update Primary Incident Record
+            incident.last_lat = float(lat)
+            incident.last_lng = float(lng)
+            incident.save()
+            
+            # 3. Sync to MongoDB (for Polling Dashboard)
+            if incident.mongo_alert_id:
+                from core.db import alerts_col
+                from bson.objectid import ObjectId
+                alerts_col.update_one(
+                    {"_id": ObjectId(incident.mongo_alert_id)},
+                    {"$set": {"lat": float(lat), "lng": float(lng)}}
+                )
 
         channel_layer = get_channel_layer()
         async_to_sync(channel_layer.group_send)(
@@ -415,7 +430,26 @@ class AdminAlertListView(APIView):
         active_alerts = list(alerts_col.find({"status": "active"}).sort("created_at", -1))
         for alert in active_alerts:
             alert["_id"] = str(alert["_id"])
-            user_doc = users_col.find_one({"_id": ObjectId(alert["user_id"])})
+            
+            # Hydrate with Latest Tracking Data from SQLite if available
+            incident = Incident.objects.filter(mongo_alert_id=alert["_id"]).first()
+            if incident:
+                alert["lat"] = incident.last_lat or alert["lat"]
+                alert["lng"] = incident.last_lng or alert["lng"]
+            
+            # Robust User Lookup (Handles both MongoDB ObjectId and legacy/Django integer IDs)
+            user_id_raw = alert.get("user_id")
+            user_doc = None
+            if user_id_raw:
+                try:
+                    if isinstance(user_id_raw, str) and len(user_id_raw) == 24:
+                        user_doc = users_col.find_one({"_id": ObjectId(user_id_raw)})
+                    else:
+                        # Try integer lookup (Django compatibility)
+                        user_doc = users_col.find_one({"_id": int(user_id_raw)})
+                except (Exception, ValueError):
+                    pass
+            
             alert["user_name"] = user_doc.get("name", "Unknown User") if user_doc else "Unknown User"
         return Response(active_alerts, status=status.HTTP_200_OK)
 

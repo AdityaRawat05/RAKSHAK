@@ -49,11 +49,11 @@ export class HandshakeService {
   public startScanning(token: string, onMatch: (foundToken: string) => void) {
     if (this.isScanning) return;
     
-    this.targetToken = token;
+    this.targetToken = token.trim().toLowerCase();
     this.onProximityMatch = onMatch;
     this.isScanning = true;
 
-    console.log(`🔍 [SIMULATED] Scanning for proximity to token: ${token}`);
+    console.log(`🔍 [SIMULATED] Scanning for proximity to token: ${this.targetToken}`);
 
     // In Simulation Mode, we automatically match after 10 seconds 
     // to simulate the time it takes to reach the victim.

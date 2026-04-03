@@ -326,8 +326,14 @@
             const email = document.getElementById('email').value;
             const password = document.getElementById('password').value;
             const errorEl = document.getElementById('login-error');
+            const loginBtn = document.querySelector('.login-btn');
+            
+            errorEl.style.display = 'none';
+            loginBtn.innerText = 'CONNECTING...';
+            loginBtn.disabled = true;
             
             try {
+                console.log('Attempting login to /api/auth/login/ ...');
                 const response = await fetch('/api/auth/login/', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -335,18 +341,26 @@
                 });
                 
                 const data = await response.json();
+                console.log('Login Response:', response.status, data);
                 
                 if (response.ok && data.access) {
                     localStorage.setItem('rakshak_admin_token', data.access);
                     document.getElementById('login-overlay').style.display = 'none';
+                    loginBtn.innerText = 'ACCESS DASHBOARD';
+                    loginBtn.disabled = false;
                     fetchAlerts();
                 } else {
                     errorEl.style.display = 'block';
-                    errorEl.innerText = data.error || '❌ Unauthorized access';
+                    errorEl.innerText = '❌ ' + (data.error || 'Unauthorized Access');
+                    loginBtn.innerText = 'ACCESS DASHBOARD';
+                    loginBtn.disabled = false;
                 }
             } catch (err) {
+                console.error('Login Error:', err);
                 errorEl.style.display = 'block';
-                errorEl.innerText = '❌ Backend connection error';
+                errorEl.innerText = '❌ Backend connection error. Check if server is running.';
+                loginBtn.innerText = 'ACCESS DASHBOARD';
+                loginBtn.disabled = false;
             }
         }
 
@@ -403,13 +417,19 @@
                         `);
                     markers[alert._id] = marker;
                     
-                    // If it's a new high-threat alert, notify
-                    if (alert.threat_level === 'HIGH') {
-                        // Play sound or zoom in
+                    // Auto-focus on new high-threat alerts
+                    if (alert.threat_level === 'HIGH' || alerts.length === 1) {
+                        focusAlert(alert);
                     }
                 } else {
-                    // Update position if it moved (future proofing)
-                    markers[alert._id].setLatLng([alert.lat, alert.lng]);
+                    const oldLatLng = markers[alert._id].getLatLng();
+                    if (oldLatLng.lat !== alert.lat || oldLatLng.lng !== alert.lng) {
+                        markers[alert._id].setLatLng([alert.lat, alert.lng]);
+                        // If it's the only alert or specifically selected, follow it
+                        if (alerts.length === 1) {
+                            map.panTo([alert.lat, alert.lng]);
+                        }
+                    }
                 }
             });
 

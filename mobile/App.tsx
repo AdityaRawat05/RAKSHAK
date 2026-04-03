@@ -130,6 +130,7 @@ export default function App() {
   const isEscalating = useRef(false);
   const dismissedAlerts = useRef<Set<string>>(new Set());
   const emergencyTokenRef = useRef<string | null>(null);
+  const evidenceCameraRef = useRef<CameraView>(null);
 
   // WebSocket Integration
   const [ws, setWs] = useState<WebSocket | null>(null);
@@ -450,17 +451,21 @@ export default function App() {
 
                // Start PROXIMITY SCAN for this alert's token
                if (nearbyAlert.emergency_token) {
-                  handshakeService.startScanning(nearbyAlert.emergency_token, async (token) => {
+                  const normalizedToken = nearbyAlert.emergency_token.toString().trim().toLowerCase();
+                  handshakeService.startScanning(normalizedToken, async (token) => {
                      // Auto-call backend on < 2m proximity detection
                      try {
+                        console.log(" [HANDSHAKE] Proximity detected! Verifying with backend...");
                         await axios.post(`${API_BASE}/alerts/verify-handshake/`, {
-                           emergency_token: token,
+                           emergency_token: token.toString().trim().toLowerCase(),
                            volunteer_rakshak_id: rakshakId, 
                            gps_coordinates: loc.coords
                         }, { headers: { Authorization: `Bearer ${authToken}` } });
                         
                         Alert.alert(" HANDSHAKE VERIFIED", "You have safely reached the victim. Thank you for your bravery!");
-                     } catch (e) { console.error("Handshake verification failed"); }
+                     } catch (e) { 
+                        console.error("Handshake verification failed", e); 
+                     }
                   });
                }
 
@@ -687,34 +692,49 @@ export default function App() {
        } catch (e) {}
     }, 5000);
 
-    // 4. Recursive 5-second Video Chunker (Live Evidence Stream)
+    // 4. Recursive 5-second Video Chunker (Live Evidence Stream via Camera)
     let sequence = 0;
-    videoInterval.current = setInterval(async () => {
+    const captureAndUpload = async () => {
+       if (!emergencyTokenRef.current) return;
        try {
          const loc = await getCurrentPositionAsync({ accuracy: 6 });
          sequence++;
-         console.log(` [CHUNK #${sequence}] Recording 5s Evidence Segment...`);
+         console.log(` [CHUNK #${sequence}] Recording 5s Evidence Segment via Camera...`);
          
-         // In simulation, we send a small placeholder blob or just metadata
-         // For a PRODUCTION build, use expo-camera's recordAsync(...) here.
+         const normalizedToken = (emergencyTokenRef.current || '').toString().trim().toLowerCase();
          const formData = new FormData();
-         formData.append('emergency_token', emergencyTokenRef.current || '');
+         formData.append('emergency_token', normalizedToken);
          formData.append('sequence', sequence.toString());
          formData.append('lat', loc.coords.latitude.toString());
          formData.append('lng', loc.coords.longitude.toString());
          
-         // Mock File omitted to prevent Axios from throwing a Network Error on fake file:// URIs.
-         // We handle the missing file directly on the backend during test mode.
-
-         await axios.post(`${API_BASE}/alerts/upload/`, formData, {
-            headers: { 
-               'Content-Type': 'multipart/form-data',
-               Authorization: `Bearer ${authToken}` 
+         if (evidenceCameraRef.current) {
+            const video = await evidenceCameraRef.current.recordAsync({ maxDuration: 5 });
+            if (video && video.uri) {
+                formData.append('file', {
+                   uri: video.uri,
+                   name: `chunk_${sequence}.mp4`,
+                   type: 'video/mp4'
+                } as any);
             }
-         });
-         
-       } catch (e) { console.error(" Chunk Stream Error:", e); }
-    }, 5000);
+         } else {
+            // Camera not mounted yet, fallback wait
+            await new Promise(r => setTimeout(r, 5000));
+         }
+
+         if (emergencyTokenRef.current) {
+            await axios.post(`${API_BASE}/alerts/upload-chunk/`, formData, {
+               headers: { 'Content-Type': 'multipart/form-data', Authorization: `Bearer ${authToken}` }
+            });
+         }
+       } catch (e) {
+           console.error(" Chunk Stream Error:", e);
+           await new Promise(r => setTimeout(r, 2000)); // Delay retry on error
+       }
+       if (emergencyTokenRef.current) captureAndUpload();
+    };
+
+    captureAndUpload(); // Start loop
 
     // Legacy Pulse Animation Support
     const createPulse = (val: Animated.Value, delay: number) => 
@@ -739,7 +759,8 @@ export default function App() {
     setIsSOSCountdown(false);
     await AsyncStorage.removeItem('RAKSHAK_ACTIVE_SOS');
     if (gpsInterval.current) clearInterval(gpsInterval.current);
-    if (videoInterval.current) clearInterval(videoInterval.current);
+    if (evidenceCameraRef.current) evidenceCameraRef.current.stopRecording();
+    emergencyTokenRef.current = null; // Exit chunking loop
 
     [pulse1, pulse2, pulse3].forEach(p => { p.stopAnimation(); p.setValue(1); });
     
@@ -1028,28 +1049,37 @@ export default function App() {
 
           <View style={styles.sosCoreContainer}>
             {isAlertActive ? (
-              <View style={[StyleSheet.absoluteFill, { borderRadius: 30, overflow: 'hidden' }]}>
+              <View style={[StyleSheet.absoluteFill, { borderRadius: 30, overflow: 'hidden', backgroundColor: '#000' }]}>
+                <CameraView 
+                   ref={evidenceCameraRef}
+                   style={StyleSheet.absoluteFill} 
+                   facing="back"
+                   mode="video"
+                />
+                
                 {userLocation && (
-                  <MapView
-                    style={{ flex: 1 }}
-                    initialRegion={{ latitude: activeRescue?.location ? activeRescue.location[1] : (userLocation?.latitude || 0.0),
-                   longitude: userLocation?.longitude || activeRescue.location[0],
-                      latitudeDelta: 0.01,
-                      longitudeDelta: 0.01,
-                    }}
-                  >
-                    <Marker coordinate={userLocation} title="You (SOS)" pinColor="red" />
-                    {comingVolunteers.map((v: any, idx: number) => (
-                      v.lat !== 0 && (
-                        <Marker 
-                          key={idx} 
-                          coordinate={{ latitude: v.lat, longitude: v.lng }} 
-                          title={`Rescuer: ${v.name}`} 
-                          pinColor="green" 
-                        />
-                      )
-                    ))}
-                  </MapView>
+                  <View style={{ position: 'absolute', bottom: 70, left: 10, width: 130, height: 180, borderRadius: 15, overflow: 'hidden', borderWidth: 2, borderColor: 'rgba(255,255,255,0.7)' }}>
+                    <MapView
+                      style={{ flex: 1 }}
+                      initialRegion={{ latitude: activeRescue?.location ? activeRescue.location[1] : (userLocation?.latitude || 0.0),
+                     longitude: userLocation?.longitude || activeRescue.location[0],
+                        latitudeDelta: 0.01,
+                        longitudeDelta: 0.01,
+                      }}
+                    >
+                      <Marker coordinate={userLocation} title="You (SOS)" pinColor="red" />
+                      {comingVolunteers.map((v: any, idx: number) => (
+                        v.lat !== 0 && (
+                          <Marker 
+                            key={idx} 
+                            coordinate={{ latitude: v.lat, longitude: v.lng }} 
+                            title={`Rescuer: ${v.name}`} 
+                            pinColor="green" 
+                          />
+                        )
+                      ))}
+                    </MapView>
+                  </View>
                 )}
                 <TouchableOpacity 
                    style={styles.stopSosOverlay} 
