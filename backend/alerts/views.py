@@ -7,12 +7,30 @@ from rest_framework.permissions import IsAuthenticated
 from .haversine import get_nearby_alerts, get_nearby_users
 from notifications.expo_push import send_expo_push
 from notifications.email_service import send_emergency_email
+from django.contrib.auth.models import User
+from .models import Incident, EvidenceChunk, IncidentLocation
+from users.models import RakshakProfile
 from datetime import datetime
 from django.utils.decorators import method_decorator
 from django_ratelimit.decorators import ratelimit
 import logging
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
+from channels.generic.websocket import AsyncWebsocketConsumer
+import json
+
+from django.views.generic import TemplateView
+from rest_framework import permissions
+from rest_framework.parsers import MultiPartParser, FormParser
 
 logger = logging.getLogger('django')
+
+class IsAdminUser(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and hasattr(request.user, 'is_admin') and request.user.is_admin)
+
+class AuthorityDashboardView(TemplateView):
+    template_name = 'alerts/authority_dashboard.html'
 
 class AlertTriggerView(APIView):
     permission_classes = [IsAuthenticated]
@@ -23,41 +41,82 @@ class AlertTriggerView(APIView):
         data = request.data
         lat = data.get('lat')
         lng = data.get('lng')
-        threat_level = data.get('threat_level', 'LOW') # 'LOW', 'MEDIUM', 'HIGH'
-        
-        user_doc = users_col.find_one({"_id": ObjectId(user_id)})
+        threat_level = data.get('threat_level', 'LOW')
+
+        user_email = request.user.email
+        user_doc = users_col.find_one({"email": user_email})
         
         alert_doc = {
             "user_id": user_id,
             "status": "created",
-            "lat": lat,
-            "lng": lng,
+            "lat": float(lat) if lat else 0.0,
+            "lng": float(lng) if lng else 0.0,
             "threat_level": threat_level,
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.utcnow().isoformat(),
+            "comm_notify_count": 0
         }
         
         result = alerts_col.insert_one(alert_doc)
         alert_id = str(result.inserted_id)
         
-        logger.warning(f"🔔 SOS Triggered: Alert {alert_id} for user {user_id}")
+        logger.warning(f"SOS Triggered: Alert {alert_id} for user {user_id}")
         
-        # Send silent check-in to user itself to prevent false alarms
         if user_doc and user_doc.get("expo_push_token"):
-            send_expo_push(
+             send_expo_push(
                 user_doc["expo_push_token"],
-                "Are you safe?",
-                "We detected a potential issue. Open the app to confirm or cancel.",
-                {"alert_id": alert_id}
-            )
-            
-        return Response({"message": "Alert triggered", "alert_id": alert_id}, status=status.HTTP_201_CREATED)
+                "RAKSHAK: SOS Initialized",
+                "Stay calm. We are monitoring your situation.",
+                {"alert_id": alert_id, "type": "SILENT_CHECK"}
+             )
+
+        try:
+            from django.contrib.auth.models import User as DjangoUser
+            real_user = DjangoUser.objects.filter(email=user_email).first()
+            if real_user:
+                incident = Incident.objects.create(
+                    victim=real_user, 
+                    status='Active', 
+                    victim_name=real_user.get_full_name() or real_user.username,
+                    mongo_alert_id=alert_id # Critical Mapping
+                )
+                emergency_token = str(incident.emergency_token)
+                
+                channel_layer = get_channel_layer()
+                async_to_sync(channel_layer.group_send)(
+                    "authority_group",
+                    {
+                        "type": "broadcast_event",
+                        "payload": {
+                            "type": "SOS_START",
+                            "incident_id": incident.id,
+                            "token": emergency_token,
+                            "victim_name": incident.victim_name,
+                            "lat": float(lat),
+                            "lng": float(lng)
+                        }
+                    }
+                )
+                logger.info(f" RAKSHAK: Authority Notified of SOS START: {incident.id}")
+            else:
+                emergency_token = None
+        except Exception as e:
+            logger.error(f" Failed to initialize ORM Incident: {e}")
+            emergency_token = None
+
+        return Response({
+            "message": "Alert triggered. Resolution window starts.",
+            "alert_id": alert_id,
+            "emergency_token": emergency_token
+        }, status=status.HTTP_201_CREATED)
 
 class AlertVerifyView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         user_id = request.user.id
+        django_user = request.user
         alert_id = request.data.get('alert_id')
+        stage = request.data.get('stage', 'guardian')
         
         if not alert_id:
             return Response({"error": "alert_id is required"}, status=status.HTTP_400_BAD_REQUEST)
@@ -66,66 +125,201 @@ class AlertVerifyView(APIView):
         if not alert_doc:
             return Response({"error": "Alert not found"}, status=status.HTTP_404_NOT_FOUND)
             
-        alerts_col.update_one({"_id": ObjectId(alert_id)}, {"$set": {"status": "active"}})
-        logger.warning(f"🚨 ALERT VERIFIED: Alert {alert_id} is now ACTIVE")
+        if alert_doc.get("status") != "active":
+            alerts_col.update_one({"_id": ObjectId(alert_id)}, {"$set": {"status": "active"}})
+            logger.info(f"ALERT VERIFIED: Alert {alert_id} is now ACTIVE")
         
-        # User details for broadcast
-        user_doc = users_col.find_one({"_id": ObjectId(user_id)})
+        from django.contrib.auth.models import User as DjangoUser
+        real_user = DjangoUser.objects.filter(email=django_user.email).first()
+        if not real_user:
+             real_user = DjangoUser.objects.filter(is_superuser=True).first()
+        
+        try:
+            incident = Incident.objects.filter(mongo_alert_id=alert_id, status='Active').last()
+            if not incident:
+                incident = Incident.objects.create(
+                    victim=real_user, 
+                    status='Active',
+                    mongo_alert_id=alert_id
+                )
+                logger.info(f"NEW INCIDENT RECORD CREATED (ESCALATION): {incident.id}")
+            else:
+                logger.info(f"USING EXISTING INCIDENT RECORD: {incident.id}")
+        except Exception as db_err:
+            logger.error(f"Database Record Failure: {db_err}")
+            return Response({"error": "Failed to manage incident record in SQLite."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        user_doc = users_col.find_one({"email": django_user.email})
         lat, lng = alert_doc.get("lat"), alert_doc.get("lng")
         map_link = f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
+        media_link = f"http://192.168.137.158:8000{incident.evidence_chunks.first().chunk_file.url}" if incident.evidence_chunks.exists() else None
+        emergency_token = str(incident.emergency_token) # SCOPE FIX: Define here for dispatchers below
 
         if user_doc:
-            logger.warning(f"📡 Dispatching notifications for {user_doc.get('name')}...")
-            
-            # 1. Automate Email to Trusted Guardian
-            contacts = list(contacts_col.find({"user_id": {"$in": [user_id, ObjectId(user_id)]}}))
-            logger.warning(f"Found {len(contacts)} contacts for user {user_id}")
-            
-            for c in contacts:
-                if c.get("email"):
-                    logger.warning(f"📧 Sending emergency email to {c['email']}")
-                    sent = send_emergency_email(c["email"], user_doc.get("name", "A Rakshak User"), map_link)
-                    if sent:
-                        logger.warning(f"✅ Email successfully sent to {c['email']}")
-                    else:
-                        logger.warning(f"❌ Failed to send email to {c['email']}")
-                else:
-                    logger.warning(f"⚠️ Contact {c.get('name')} is missing an email address")
-                
-            # 2. Community Broadcast (Push to Users within 200m)
-            if lat and lng:
-                nearby_tokens = get_nearby_users(lat, lng, radius_m=200)
-                logger.warning(f"Found {len(nearby_tokens)} nearby devices")
-                for token in nearby_tokens:
-                    if token != user_doc.get("expo_push_token"):
-                        send_expo_push(
-                            token,
-                            "🚨 DISTRESS NEARBY",
-                            "Someone within 200m needs immediate help!",
-                            {"alert_id": alert_id, "type": "NEARBY_SOS", "lat": lat, "lng": lng}
-                        )
+            if stage in ['all', 'guardian']:
+                try:
+                    contacts = user_doc.get("trust_contacts", [])
+                    for c in contacts:
+                        if c.get("email"):
+                            send_emergency_email(c["email"], user_doc.get("name", "A Rakshak User"), map_link)
+                            
+                    contact_phones = [c["phone"] for c in contacts if c.get("phone")]
+                    contact_users = users_col.find({"phone": {"$in": contact_phones}})
+                    for contact_user in contact_users:
+                        if contact_user.get("expo_push_token"):
+                            send_expo_push(
+                                contact_user["expo_push_token"],
+                                "🚨 EMERGENCY ALERT",
+                                f"{user_doc.get('name')} is in danger!",
+                                {"alert_id": alert_id, "type": "EMERGENCY"}
+                            )
+                except Exception as g_err:
+                    logger.error(f"Guardian Dispatch Error: {g_err}")
 
-            # 3. Direct App Push to Trusted Contacts (standard)
-            contact_phones = [c["phone"] for c in contacts]
-            contact_users = users_col.find({"phone": {"$in": contact_phones}})
-            # Count the number of push tokens found
-            push_count = 0
-            for contact_user in contact_users:
-                if contact_user.get("expo_push_token"):
-                    push_count += 1
-                    send_expo_push(
-                        contact_user["expo_push_token"],
-                        "🚨 EMERGENCY ALERT",
-                        f"{user_doc.get('name')} is in danger!",
-                        {"alert_id": alert_id, "type": "EMERGENCY"}
+            if stage in ['all', 'community']:
+                if lat and lng:
+                    res = alerts_col.find_one_and_update(
+                        {"_id": ObjectId(alert_id), "comm_notify_count": {"$lt": 2}},
+                        {"$inc": {"comm_notify_count": 1}},
+                        return_document=True
                     )
-            logger.warning(f"📱 Sent {push_count} push notifications to trusted contacts")
+                    
+                    if res:
+                        try:
+                            notify_count = res.get("comm_notify_count", 0)
+                            nearby_users = get_nearby_users(lat, lng, radius_m=2000, exclude_user_id=user_id)
+                            logger.info(f"Atomic Signal {notify_count}/2 Dispatched for Alert {alert_id}")
+                            
+                            channel_layer = get_channel_layer()
+                            
+                            for user_data in nearby_users:
+                                u_id = str(user_data.get("_id"))
+                                if user_data.get("expo_push_token"):
+                                    send_expo_push(user_data["expo_push_token"], "🚨 DISTRESS NEARBY", "Tap to help!", {
+                                        "type": "NEARBY_SOS", 
+                                        "alert_id": alert_id,
+                                        "emergency_token": emergency_token,  # Critical Sync
+                                        "lat": lat, 
+                                        "lng": lng
+                                    })
+                                async_to_sync(channel_layer.group_send)(
+                                    f"user_{u_id}",
+                                    {
+                                        "type": "emergency_alert",
+                                        "alert_type": "EMERGENCY_ALERT",
+                                        "alert_id": alert_id,
+                                        "rakshak_id": user_doc.get("rakshak_id"),
+                                        "name": user_doc.get("name"),
+                                        "location": [lng, lat],
+                                        "threat_level": "CRITICAL"
+                                    }
+                                )
+
+                        except Exception as community_err:
+                            logger.error(f"Community Dispatch Error: {community_err}")
+                    else:
+                        logger.info(f"Atomic Guard: Blocked redundant broadcast for {alert_id}")
         
-        return Response({"message": "Alert verified and contacts notified"}, status=status.HTTP_200_OK)
+        return Response({
+            "message": "Alert verified and protocol active",
+            "emergency_token": str(incident.emergency_token)
+        }, status=status.HTTP_200_OK)
+
+class VerifyHandshakeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        token = request.data.get('emergency_token')
+        rescuer_rakshak_id = request.data.get('volunteer_rakshak_id')
+        if not token or not rescuer_rakshak_id:
+            return Response({"error": "Missing token or ID"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        try:
+            incident = Incident.objects.filter(emergency_token=token, status='Active').first()
+        except Exception:
+            return Response({"error": "Invalid token format"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        if not incident:
+            return Response({"error": "Active incident with this token not found"}, status=status.HTTP_404_NOT_FOUND)
+        profile = RakshakProfile.objects.filter(rakshak_id=rescuer_rakshak_id).first()
+        if not profile:
+            return Response({"error": "Rescuer profile not found"}, status=status.HTTP_404_NOT_FOUND)
+        incident.rescuer = profile.user
+        incident.status = 'Verified'
+        incident.verified_at = datetime.utcnow()
+        incident.save()
+        profile.trust_score += 5
+        profile.save()
+        
+        logger.info(f"HANDSHAKE COMPLETE: Incident {incident.id} verified by {rescuer_rakshak_id}")
+        
+        try:
+            victim_user = incident.victim
+            victim_doc = users_col.find_one({"email": victim_user.email})
+            if victim_doc:
+                contacts = victim_doc.get("trust_contacts", [])
+                for c in contacts:
+                    if c.get("email"):
+                        send_emergency_email(
+                            c["email"], 
+                            victim_doc.get("name", "Victim"), 
+                            f"Help has arrived! The rescue is being handled by Verified Volunteer: {rescuer_rakshak_id}"
+                        )
+                    contact_user = users_col.find_one({"phone": c.get("phone")})
+                    if contact_user and contact_user.get("expo_push_token"):
+                        send_expo_push(
+                            contact_user["expo_push_token"],
+                            "RESCUE ARRIVED",
+                            f"Help has arrived for {victim_doc.get('name')}. Rescuer: {rescuer_rakshak_id}",
+                            {"type": "HELP_ARRIVED", "volunteer_id": rescuer_rakshak_id}
+                        )
+        except Exception as notify_err:
+            logger.error(f"Handshake Notification Failure: {notify_err}")
+
+        return Response({
+            "message": "Handshake successful. Family notified.",
+            "victim_name": incident.victim.username,
+            "new_trust_score": profile.trust_score
+        }, status=status.HTTP_200_OK)
+
+class VerifyBiometricView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user_email = request.user.email.strip().lower()
+        current_vector = request.data.get('biometric_vector')
+        
+        if not current_vector or not isinstance(current_vector, list):
+            return Response({"error": "Valid biometric vector required"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        user_doc = users_col.find_one({"email": user_email})
+
+        if not user_doc or "biometric_vector" not in user_doc:
+            return Response({"error": "No enrolled biometric data found. Please enroll during signup."}, status=status.HTTP_401_UNAUTHORIZED)
+
+            
+        stored_vector = user_doc.get("biometric_vector")
+        
+        from .biometric_utils import cosine_similarity
+        similarity = cosine_similarity(stored_vector, current_vector)
+        
+        logger.info(f"BIOMETRIC CHALLENGE: User {user_email} Similarity: {similarity:.4f}")
+        
+        if similarity >= 0.85:
+            return Response({
+                "verified": True,
+                "similarity": similarity,
+                "token": "BIO_AUTH_SUCCESS_" + str(int(datetime.utcnow().timestamp()))
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({
+                "verified": False,
+                "similarity": similarity,
+                "error": "Signature mismatch"
+            }, status=status.HTTP_401_UNAUTHORIZED)
 
 class AlertNearbyView(APIView):
     permission_classes = [IsAuthenticated]
-
     def get(self, request):
         try:
             lat = float(request.GET.get('lat'))
@@ -133,22 +327,95 @@ class AlertNearbyView(APIView):
             radius = float(request.GET.get('radius_m', 1500))
         except (TypeError, ValueError):
             return Response({"error": "Invalid lat, lng, or radius"}, status=status.HTTP_400_BAD_REQUEST)
+        nearby = get_nearby_alerts(lat, lng, radius, exclude_user_id=request.user.id)
+        
+        # Hydrate nearby alerts with emergency_tokens from Django Incident Model
+        for alert in nearby:
+            # FIX: MongoDB Hex IDs cannot be mapped to SQLite Integer IDs directly.
+            # We now use the dedicated mongo_alert_id field.
+            incident = Incident.objects.filter(mongo_alert_id=alert['alert_id']).first() 
+            if not incident:
+                # Try fallback by alert_id stored in metadata if available
+                incident = Incident.objects.filter(emergency_token=alert.get('token')).first()
             
-        nearby = get_nearby_alerts(lat, lng, radius)
+            if incident:
+                alert['emergency_token'] = str(incident.emergency_token)
+            else:
+                alert['emergency_token'] = None
+
         return Response(nearby, status=status.HTTP_200_OK)
+
+class UploadEvidenceChunkView(APIView):
+    parser_classes = (MultiPartParser, FormParser)
+
+    def post(self, request):
+        token = request.data.get('emergency_token')
+        sequence = request.data.get('sequence', 0)
+        file_obj = request.FILES.get('file')
+        lat = request.data.get('lat')
+        lng = request.data.get('lng')
+
+        incident = Incident.objects.filter(emergency_token=token, status='Active').first()
+        if not incident:
+            return Response({"error": "Incident not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not file_obj:
+            from django.core.files.base import ContentFile
+            file_obj = ContentFile(b"Mock video chunk for pipeline testing", name=f"chunk_{sequence}.mp4")
+
+        chunk = EvidenceChunk.objects.create(
+            incident=incident,
+            chunk_file=file_obj,
+            sequence_number=sequence
+        )
+
+        if lat and lng:
+            IncidentLocation.objects.create(incident=incident, lat=lat, lng=lng)
+
+        channel_layer = get_channel_layer()
+        async_to_sync(channel_layer.group_send)(
+            "authority_group",
+            {
+                "type": "broadcast_event",
+                "payload": {
+                    "type": "NEW_CHUNK",
+                    "incident_id": incident.id,
+                    "chunk_url": chunk.chunk_file.url,
+                    "sequence": sequence,
+                    "lat": float(lat) if lat else None,
+                    "lng": float(lng) if lng else None,
+                    "timestamp": chunk.timestamp.isoformat()
+                }
+            }
+        )
+
+        return Response({"status": "Chunk Uploaded"}, status=status.HTTP_201_CREATED)
 
 class AlertResolveView(APIView):
     permission_classes = [IsAuthenticated]
-
     def post(self, request, alert_id):
         user_id = request.user.id
-        
         result = alerts_col.update_one(
             {"_id": ObjectId(alert_id), "user_id": user_id},
             {"$set": {"status": "resolved", "resolved_at": datetime.utcnow().isoformat()}}
         )
-        
         if result.modified_count == 0:
             return Response({"error": "Alert not found or unauthorized"}, status=status.HTTP_404_NOT_FOUND)
-            
         return Response({"message": "Alert resolved successfully"}, status=status.HTTP_200_OK)
+
+class AdminAlertListView(APIView):
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    def get(self, request):
+        active_alerts = list(alerts_col.find({"status": "active"}).sort("created_at", -1))
+        for alert in active_alerts:
+            alert["_id"] = str(alert["_id"])
+            user_doc = users_col.find_one({"_id": ObjectId(alert["user_id"])})
+            alert["user_name"] = user_doc.get("name", "Unknown User") if user_doc else "Unknown User"
+        return Response(active_alerts, status=status.HTTP_200_OK)
+
+class AdminDashboardView(TemplateView):
+    template_name = "alerts/dashboard.html"
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["total_active"] = alerts_col.count_documents({"status": "active"})
+        return context

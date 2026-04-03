@@ -9,11 +9,27 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-def get_nearby_alerts(user_lat, user_lon, radius_m=1000):
-    active = alerts_col.find({"status": "active"})
+def get_nearby_alerts(user_lat, user_lon, radius_m=1000, exclude_user_id=None):
+    from bson.objectid import ObjectId
+    from datetime import datetime, timedelta
+    
+    # Only consider alerts created within the last 2 hours to prevent stale warnings
+    two_hours_ago = (datetime.utcnow() - timedelta(hours=2)).isoformat()
+    
+    query = {
+        "status": "active",
+        "created_at": {"$gte": two_hours_ago}
+    }
+    
+    active = alerts_col.find(query)
     nearby = []
     
     for alert in active:
+
+        # Exclude the user's own alerts
+        if exclude_user_id and str(alert.get("user_id")) == str(exclude_user_id):
+            continue
+
         lat = alert.get("lat")
         lng = alert.get("lng")
         if lat is not None and lng is not None:
@@ -21,32 +37,40 @@ def get_nearby_alerts(user_lat, user_lon, radius_m=1000):
             if dist <= radius_m:
                 nearby.append({
                     "alert_id": str(alert["_id"]),
+                    "user_id": str(alert.get("user_id")),
                     "timestamp": alert.get("created_at"),
-                    "threat_level": alert.get("threat_level", "UNKNOWN")
-                    # Deliberately omitting user_id, name, phone, exactly precise GPS
+                    "threat_level": alert.get("threat_level", "UNKNOWN"),
+                    "lat": lat,
+                    "lng": lng
                 })
                 
     return nearby
 
-def get_nearby_users(center_lat, center_lon, radius_m=200):
+def get_nearby_users(center_lat, center_lon, radius_m=200, exclude_user_id=None):
     """
-    Finds all users with push tokens whose last known location is within
-    the target radius.
+    Finds all users whose last known location is within the target radius using MongoDB's $near 2dsphere index.
     """
-    # In a production environment with millions of users, this would use
-    # MongoDB's built-in 2dsphere index and $near query.
-    # For Rakshak's initial scale, we use a manual filter loop.
-    users = users_col.find({"location": {"$ne": None}, "expo_push_token": {"$ne": None}})
-    nearby_tokens = []
+    query = {
+        "location": {
+            "$near": {
+                "$geometry": {
+                    "type": "Point",
+                    "coordinates": [float(center_lon), float(center_lat)]
+                },
+                "$maxDistance": radius_m
+            }
+        }
+    }
+    
+    if exclude_user_id:
+        from bson.objectid import ObjectId
+        query["_id"] = {"$ne": ObjectId(exclude_user_id)}
+    
+    users = users_col.find(query)
+    nearby_users = []
     
     for user in users:
-        loc = user.get("location")
-        u_lat = loc.get("lat")
-        u_lng = loc.get("lng")
-        
-        if u_lat and u_lng:
-            dist = haversine(center_lat, center_lon, u_lat, u_lng)
-            if dist <= radius_m:
-                nearby_tokens.append(user["expo_push_token"])
+        user["_id"] = str(user["_id"])
+        nearby_users.append(user)
                 
-    return nearby_tokens
+    return nearby_users

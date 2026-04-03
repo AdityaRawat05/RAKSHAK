@@ -3,10 +3,9 @@ from django.conf import settings
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from core.db import evidence_col, keywords_col
+from core.db import evidence_col, keywords_col, users_col
 from bson.objectid import ObjectId
 from rest_framework.permissions import IsAuthenticated
-from .encryption import EncryptionService
 from django.utils.decorators import method_decorator
 from django_ratelimit.decorators import ratelimit
 import uuid
@@ -27,26 +26,31 @@ class KeywordUploadView(APIView):
         if file_extension.lower() not in allowed_extensions:
             return Response({"error": f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Encrypt the raw bytes
-        raw_bytes = audio_file.read()
-        encrypted_bytes = EncryptionService.encrypt_file(raw_bytes)
+        # Get user name for filename
+        user_doc = users_col.find_one({"_id": ObjectId(user_id)})
+        user_name = user_doc.get("name", "UnknownUser").replace(" ", "_")
 
-        # Save to disk
-        filename = f"{user_id}_{uuid.uuid4().hex}.enc"
+        # Save to disk as raw bytes (No Encryption)
+        raw_bytes = audio_file.read()
+        
+        # Determine extension
+        ext = audio_file.name.split('.')[-1] if '.' in audio_file.name else 'bin'
+        filename = f"{user_name}_KEYWORD_{uuid.uuid4().hex[:8]}.{ext}"
         file_path = os.path.join(settings.MEDIA_ROOT, 'keywords', filename)
         
         # Ensure directories exist
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         
         with open(file_path, 'wb') as f:
-            f.write(encrypted_bytes)
+            f.write(raw_bytes)
 
         # Update metadata in DB
         doc = {
             "user_id": user_id,
+            "user_name": user_name,
             "file_path": file_path,
             "filename": filename,
-            "encrypted": True
+            "encrypted": False
         }
         
         # Delete old keyword if any
@@ -67,23 +71,29 @@ class EvidenceUploadView(APIView):
         if not alert_id or not evidence_file:
             return Response({"error": "alert_id and file are required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        raw_bytes = evidence_file.read()
-        encrypted_bytes = EncryptionService.encrypt_file(raw_bytes)
+        # Get user name
+        user_doc = users_col.find_one({"_id": ObjectId(user_id)})
+        user_name = user_doc.get("name", "UnknownUser").replace(" ", "_")
 
-        filename = f"{alert_id}_{uuid.uuid4().hex}.enc"
+        raw_bytes = evidence_file.read()
+        
+        # Determine extension
+        ext = evidence_file.name.split('.')[-1] if '.' in evidence_file.name else 'bin'
+        filename = f"{user_name}_SOS_{alert_id[:8]}_{uuid.uuid4().hex[:6]}.{ext}"
         file_path = os.path.join(settings.MEDIA_ROOT, 'evidence', filename)
         
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         
         with open(file_path, 'wb') as f:
-            f.write(encrypted_bytes)
+            f.write(raw_bytes)
 
         doc = {
             "user_id": user_id,
+            "user_name": user_name,
             "alert_id": alert_id,
             "file_path": file_path,
             "filename": filename,
-            "encrypted": True
+            "encrypted": False
         }
         
         result = evidence_col.insert_one(doc)

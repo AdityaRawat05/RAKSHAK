@@ -2,6 +2,8 @@
 
 **RAKSHAK** is a state-of-the-art emergency response and personal safety system designed for women's security. It integrates **on-device machine learning**, **real-time geospatial broadcasts**, and **privacy-first architectural patterns** to provide a hands-free, high-reliability safety net.
 
+### 📥 [Demo Video](https://drive.google.com/file/d/13Qjk0j1lr2g3Swm_Z4AerXLqlsmP2xQ2/view?usp=drivesdk)
+
 ---
 
 ## ✨ Key Features

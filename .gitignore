@@ -4,6 +4,9 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.expo-shared/
+web-build/
+dist/
 
 # Python/Django
 __pycache__/
@@ -18,6 +21,7 @@ ENV/
 db.sqlite3
 media/
 *.log
+local_settings.py
 
 # IDEs and Tools
 .vscode/
@@ -28,3 +32,7 @@ media/
 
 # AI/Local tooling
 .gemini/
+antigravity/
+brain/
+artifacts/
+/tmp/

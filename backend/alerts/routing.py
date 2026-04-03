@@ -1,6 +1,7 @@
-from django.urls import re_path
+from django.urls import path
 from . import consumers
 
 websocket_urlpatterns = [
-    re_path(r'ws/location/(?P<alert_id>[^/]+)/$', consumers.LocationConsumer.as_asgi()),
+    path('ws/safety/', consumers.SafetyConsumer.as_asgi()),
+    path('ws/authority/', consumers.AuthorityConsumer.as_asgi()),
 ]

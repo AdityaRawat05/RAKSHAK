@@ -8,7 +8,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-test')
 DEBUG = config('DEBUG', default=True, cast=bool)
 # Add specific IP from report to ALLOWED_HOSTS
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1,10.99.63.128,*').split(',')
+ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1,192.168.137.158,10.99.63.128,*').split(',')
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -123,16 +123,22 @@ LOGGING = {
         },
     },
     'handlers': {
+        'console': {
+            'level': 'WARNING',
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
         'file': {
             'level': 'WARNING',
             'class': 'logging.FileHandler',
             'filename': os.path.join(BASE_DIR, 'logs', 'rakshak.log'),
             'formatter': 'verbose',
+            'encoding': 'utf-8',
         },
     },
     'loggers': {
         'django': {
-            'handlers': ['file'],
+            'handlers': ['console', 'file'],
             'level': 'WARNING',
             'propagate': True,
         },

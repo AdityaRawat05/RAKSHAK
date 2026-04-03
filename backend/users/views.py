@@ -6,9 +6,12 @@ from django.utils.decorators import method_decorator
 from rest_framework_simplejwt.tokens import RefreshToken
 import bcrypt
 from core.db import users_col
-from bson.objectid import ObjectId
 from rest_framework.permissions import IsAuthenticated
+from django.contrib.auth.models import User
+from .models import RakshakProfile
 import logging
+from datetime import datetime
+from bson.objectid import ObjectId
 
 logger = logging.getLogger('django')
 
@@ -37,21 +40,45 @@ class RegisterView(APIView):
             "phone": phone,
             "password": hashed,
             "name": name,
+            "biometric_vector": data.get('biometric_vector'), # 128-dim Faceprint
             "expo_push_token": None,
             "location": None
         }
+
         
         result = users_col.insert_one(user_doc)
         user_id = str(result.inserted_id)
         
-        # Manual token generation to avoid SimpleJWT model requirements
-        refresh = RefreshToken()
+        # --- NEW SHADOW USER & PROFILE INTEGRATION ---
+        # Create a Django User and ensure RakshakProfile exists
+        try:
+            django_user, created = User.objects.get_or_create(username=email, email=email)
+            if created:
+                django_user.set_password(password)
+                django_user.save()
+            
+            # --- DEFENSIVE: Ensure profile exists even if user was previously created ---
+            from .signals import generate_rakshak_id
+            profile, p_created = RakshakProfile.objects.get_or_create(user=django_user)
+            if p_created or not profile.rakshak_id:
+                profile.rakshak_id = generate_rakshak_id()
+                profile.save()
+                
+            rakshak_id = profile.rakshak_id
+            users_col.update_one({"_id": ObjectId(user_id)}, {"$set": {"rakshak_id": rakshak_id}})
+        except Exception as e:
+            logger.error(f"❌ Shadow User/Profile Sync Error: {e}")
+            return Response({"error": "Identity synchronization failed. Please try again."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        refresh = RefreshToken.for_user(django_user)
         refresh['user_id'] = user_id
         
         return Response({
             "access": str(refresh.access_token),
             "refresh": str(refresh),
-            "user_id": user_id
+            "user_id": user_id,
+            "rakshak_id": rakshak_id,
+            "biometric_vector": user_doc.get("biometric_vector")
         }, status=status.HTTP_201_CREATED)
 
 class LoginView(APIView):
@@ -76,32 +103,47 @@ class LoginView(APIView):
             logger.warning(f"❌ Login Failure: Password mismatch for user '{email}'")
             return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
             
+        # --- SYSTEM SELF-HEALING: Ensure Django User exists for JWT ---
+        django_user, created = User.objects.get_or_create(email=email, defaults={'username': email})
+        if not created:
+            django_user.set_password(password)
+            django_user.save()
+            
+        # Ensure RakshakProfile exists for handshakes
+        rakshak_profile, _ = RakshakProfile.objects.get_or_create(user=django_user)
+        rakshak_id = rakshak_profile.rakshak_id
         user_id = str(user_doc["_id"])
         
-        # Manual token generation to avoid SimpleJWT model requirements
-        refresh = RefreshToken()
+        refresh = RefreshToken.for_user(django_user)
+        # --- FIX: Manually inject MongoDB ID into token claims for PyMongoJWTAuthentication ---
         refresh['user_id'] = user_id
+
         
         return Response({
             "access": str(refresh.access_token),
             "refresh": str(refresh),
-            "user_id": user_id
+            "user_id": user_id,
+            "rakshak_id": rakshak_id,
+            "biometric_enrolled": bool(user_doc.get("biometric_vector")),
+            "biometric_vector": user_doc.get("biometric_vector")
         }, status=status.HTTP_200_OK)
+
+
 
 class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        user_id = request.user.id
-        user_doc = users_col.find_one({"_id": ObjectId(user_id)}, {"password": 0})
+        user_email = request.user.email.strip().lower()
+        user_doc = users_col.find_one({"email": user_email}, {"password": 0})
         if not user_doc:
-            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "User not found in custom database"}, status=status.HTTP_404_NOT_FOUND)
             
         user_doc["_id"] = str(user_doc["_id"])
         return Response(user_doc, status=status.HTTP_200_OK)
         
     def put(self, request):
-        user_id = request.user.id
+        user_email = request.user.email.strip().lower()
         data = request.data
         update_fields = {}
         
@@ -109,9 +151,33 @@ class ProfileView(APIView):
         if 'phone' in data: update_fields['phone'] = data['phone']
         if 'expo_push_token' in data: update_fields['expo_push_token'] = data['expo_push_token']
         if 'location' in data: update_fields['location'] = data['location']
+        if 'biometric_vector' in data: update_fields['biometric_vector'] = data['biometric_vector']
         
         if not update_fields:
             return Response({"error": "No update fields provided"}, status=status.HTTP_400_BAD_REQUEST)
             
-        users_col.update_one({"_id": ObjectId(user_id)}, {"$set": update_fields})
+        result = users_col.update_one({"email": user_email}, {"$set": update_fields})
+        if result.matched_count == 0:
+            return Response({"error": "Failed to locate user identity record"}, status=status.HTTP_404_NOT_FOUND)
+            
         return Response({"message": "Profile updated successfully"}, status=status.HTTP_200_OK)
+
+
+class UpdateLocationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user_id = request.user.id
+        lat = request.data.get('lat')
+        lng = request.data.get('lng')
+
+        if lat is None or lng is None:
+            return Response({"error": "lat and lng are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Update MongoDB users collection with the new location as GeoJSON
+        users_col.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"location": {"type": "Point", "coordinates": [float(lng), float(lat)]}, "last_seen": datetime.utcnow().isoformat()}}
+        )
+
+        return Response({"message": "Location synchronized"}, status=status.HTTP_200_OK)

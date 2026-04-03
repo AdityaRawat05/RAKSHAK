@@ -9,6 +9,7 @@ urlpatterns = [
     path('api/profile/', include('users.urls_profile')),
     path('api/contacts/', include('contacts.urls')),
     path('api/alerts/', include('alerts.urls')),
+    path('alerts/', include('alerts.urls')), # Dashboard accessibility
     path('api/evidence/', include('evidence.urls')),
     path('api/keyword/', include('evidence.urls_keyword')),
 ]
