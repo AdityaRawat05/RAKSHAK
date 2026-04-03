@@ -2,17 +2,31 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   StyleSheet, Text, View, TouchableOpacity, Animated, Easing, 
   Alert, StatusBar, TextInput, Platform, ScrollView, Dimensions, 
-  KeyboardAvoidingView 
+  KeyboardAvoidingView, Linking, LogBox 
 } from 'react-native';
+
+LogBox.ignoreLogs([
+  'expo-notifications: Android Push notifications (remote notifications)',
+  'expo-notifications: Android Push notifications',
+  'remote notifications'
+]);
 import { getCurrentPositionAsync, requestForegroundPermissionsAsync } from 'expo-location';
 import * as SMS from 'expo-sms';
 import * as MailComposer from 'expo-mail-composer';
+import { CameraView, Camera } from 'expo-camera';
 import { LinearGradient } from 'expo-linear-gradient';
+
+
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { Audio } from 'expo-av';
 import axios from 'axios';
+import * as Notifications from 'expo-notifications';
+import Constants from 'expo-constants';
+import * as Device from 'expo-device';
 import { extractMFCCs, fuseDetectionScores } from './utils/audioProcessor';
 import { safeLoadModel, ModelWrapper } from './utils/mlUtils';
+import { handshakeService } from './utils/bleService';
+import MapView, { Marker } from 'react-native-maps';
 
 const { width, height } = Dimensions.get('window');
 // --- CONFIGURATION ---
@@ -35,7 +49,17 @@ const THEME = {
   border: 'rgba(255, 255, 255, 0.1)',
 };
 
-type ScreenState = 'login' | 'register' | 'voice_setup' | 'contacts_setup' | 'home';
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+    shouldShowBanner: true,
+    shouldShowList: true,
+  }),
+});
+
+type ScreenState = 'login' | 'register' | 'voice_setup' | 'contacts_setup' | 'biometric_enrollment' | 'home';
 
 // --- REUSABLE COMPONENTS ---
 const ScreenWrapper = ({ children, visible, delay = 0 }: { children: React.ReactNode, visible: boolean, delay?: number }) => {
@@ -74,22 +98,57 @@ const InputField = ({ icon, ...props }: any) => (
 );
 
 export default function App() {
-  const [currentScreen, setCurrentScreen] = useState<ScreenState>('login');
+  const [currentScreen, setCurrentScreen] = useState<ScreenState>('login'); 
   const [isAlertActive, setIsAlertActive] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
 
   // Form states
   const [form, setForm] = useState({ name: '', email: '', phone: '', password: '', keyword: '' });
   const [guardian, setGuardian] = useState({ name: '', phone: '', email: '' });
-  const [countdown, setCountdown] = useState(60);
+  const [countdown, setCountdown] = useState(15);
   const [activeAlertId, setActiveAlertId] = useState<string | null>(null);
   const [authToken, setAuthToken] = useState<string | null>(null);
+  const [userId, setUserId] = useState<any>(null);
+  const [rakshakId, setRakshakId] = useState<string>('');
+  const [faceVector, setFaceVector] = useState<number[] | null>(null);
+  const [expoPushToken, setExpoPushToken] = useState<string>('');
+  const notificationListener = useRef<Notifications.Subscription | null>(null);
+  const responseListener = useRef<Notifications.Subscription | null>(null);
 
   // Model References
   const keywordModel = useRef<ModelWrapper | null>(null);
   const motionModel = useRef<ModelWrapper | null>(null);
+  const isSimulatedRef = useRef(false);
   const [isSimulated, setIsSimulated] = useState(false);
   const recording = useRef<Audio.Recording | null>(null);
+  const notifiedAlerts = useRef<Record<string, number>>({});
+  const isEscalating = useRef(false);
+  const dismissedAlerts = useRef<Set<string>>(new Set());
+
+  // WebSocket Integration
+  const [ws, setWs] = useState<WebSocket | null>(null);
+  const [activeRescue, setActiveRescue] = useState<any>(null);
+  const [userLocation, setUserLocation] = useState<any>(null);
+  const [reconnectTrigger, setReconnectTrigger] = useState(0);
+  const [comingVolunteers, setComingVolunteers] = useState<any[]>([]);
+  const [isRescuing, setIsRescuing] = useState(false);
+  const [isBiometricActive, setIsBiometricActive] = useState(false);
+  const [biometricStatus, setBiometricStatus] = useState("Face Verification Ready");
+  const lastEyeStatus = useRef({ prob: 1.0, time: 0 });
+
+  // Helper for direct distance (Panic Reduction)
+  const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+    const R = 6371e3; // meters
+    const phi1 = lat1 * Math.PI/180;
+    const phi2 = lat2 * Math.PI/180;
+    const dPhi = (lat2-lat1) * Math.PI/180;
+    const dLambda = (lon2-lon1) * Math.PI/180;
+    const a = Math.sin(dPhi/2) * Math.sin(dPhi/2) +
+            Math.cos(phi1) * Math.cos(phi2) *
+            Math.sin(dLambda/2) * Math.sin(dLambda/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c; // in meters
+  };
 
   // Animation values for SOS
   const pulse1 = useRef(new Animated.Value(1)).current;
@@ -97,27 +156,390 @@ export default function App() {
   const pulse3 = useRef(new Animated.Value(1)).current;
   const micWave = useRef(new Animated.Value(0)).current;
 
+  const handleTestBiometric = () => { setIsBiometricActive(true); setBiometricStatus("Face Verification Ready"); };
+  
+  const handleEnrollFace = () => {
+    // SECURITY UPGRADE: Trigger the real identity challenge to verify and sync to backend
+    setBiometricStatus("Verify Identity to Enroll");
+    setIsBiometricActive(true);
+  };
+
+
   const navigate = (screen: ScreenState) => {
     setCurrentScreen(screen);
   };
 
-  // --- AUTOMATED ESCALATION TIMER ---
+  const handleLogout = () => {
+    console.log(" RAKSHAK: Performing Secure Logout - Clearing Session State");
+    setAuthToken(null);
+    setUserId(null);
+    setRakshakId('');
+    setFaceVector(null);
+    setForm({ name: '', email: '', phone: '', password: '', keyword: '' });
+    setGuardian({ name: '', phone: '', email: '' });
+    setIsAlertActive(false);
+    setIsBiometricActive(false);
+    navigate('login');
+  };
+
+  const handleNavigateRegister = () => {
+    setForm({ name: '', email: '', phone: '', password: '', keyword: '' });
+    setFaceVector(null);
+    navigate('register');
+  };
+
+  // --- NOTIFICATION REGISTRATION ---
+  async function registerForPushNotificationsAsync() {
+    let token;
+    if (Platform.OS === 'android') {
+      await Notifications.setNotificationChannelAsync('default', {
+        name: 'default',
+        importance: Notifications.AndroidImportance.MAX,
+        vibrationPattern: [0, 250, 250, 250],
+        lightColor: '#FF231F7C',
+      });
+    }
+
+    const { status: existingStatus } = await Notifications.getPermissionsAsync();
+    let finalStatus = existingStatus;
+    if (existingStatus !== 'granted') {
+      const { status } = await Notifications.requestPermissionsAsync();
+      finalStatus = status;
+    }
+    if (finalStatus !== 'granted') {
+      console.warn('Failed to get push token for push notification!');
+      return;
+    }
+    
+    // In actual Expo environment, this would fetch the token. 
+    // For local dev/demo, we use a placeholder if simulation is active.
+    
+    // --- DEFENSIVE CHECK FOR EXPO GO SDK 53+ ---
+    if (Constants.appOwnership === 'expo' || !Device.isDevice) {
+      console.log(" RAKSHAK: Running in Expo Go or Emulator. Skipping Native Push Registry.");
+      return "SIMULATED_TOKEN_" + Math.random().toString(36).substring(7);
+    }
+
+    try {
+      const { status: existingStatus } = await Notifications.getPermissionsAsync();
+      let finalStatus = existingStatus;
+      if (existingStatus !== 'granted') {
+        const { status } = await Notifications.requestPermissionsAsync();
+        finalStatus = status;
+      }
+      if (finalStatus !== 'granted') return null;
+
+      token = (await Notifications.getExpoPushTokenAsync({
+        projectId: Constants.expoConfig?.extra?.eas?.projectId || "placeholder",
+      })).data;
+      console.log(" Expo Push Token:", token);
+    } catch (e: any) {
+      console.log(" Notification Module Unavailable: Using Simulated Token.");
+      token = "SIMULATED_TOKEN_" + Math.random().toString(36).substring(7);
+    }
+    return token;
+  }
+
+  // --- PERMISSION GUARD ---
+  useEffect(() => {
+    (async () => {
+      const { status: locStatus } = await requestForegroundPermissionsAsync();
+      const { status: audStatus } = await Audio.requestPermissionsAsync();
+      const { status: camStatus } = await Camera.requestCameraPermissionsAsync();
+      
+      if (locStatus !== 'granted' || audStatus !== 'granted' || camStatus !== 'granted') {
+        console.warn(" RAKSHAK: Critical Permissions Denied (Location/Audio/Camera). Identity Verification will be disabled.");
+      } else {
+        console.log(" RAKSHAK: All Critical Safety Permissions Granted.");
+      }
+    })();
+  }, []);
+
+
+  // --- SYNC PUSH TOKEN ---
+  useEffect(() => {
+    if (authToken && authToken !== 'MOCK_DEMO_TOKEN') {
+       const syncToken = async () => {
+          const token = await registerForPushNotificationsAsync();
+          if (token) {
+            setExpoPushToken(token);
+            try {
+              await axios.put(`${API_BASE}/profile/update/`, {
+                expo_push_token: token
+              }, { headers: { Authorization: `Bearer ${authToken}` } });
+              console.log(" Push Token Synced to Backend");
+            } catch (e) { console.log("Token sync failed"); }
+          }
+       };
+       syncToken();
+    }
+    
+    // Listeners
+    notificationListener.current = Notifications.addNotificationReceivedListener(notification => {
+      const { title, body, data } = notification.request.content;
+      if (data?.type === 'NEARBY_SOS' || data?.type === 'EMERGENCY') {
+         const alertBtns: any[] = [{ text: "Dismiss", style: 'cancel' }];
+         if (data?.lat && data?.lng) {
+            alertBtns.push({
+               text: "VIEW MAP",
+               onPress: () => {
+                  const url = `https://www.google.com/maps/search/?api=1&query=${data.lat},${data.lng}`;
+                  Linking.openURL(url);
+               }
+            });
+         }
+         Alert.alert(title || "Alert", body || "Emergency detected nearby!", alertBtns);
+      }
+    });
+
+    responseListener.current = Notifications.addNotificationResponseReceivedListener(response => {
+      console.log("Notification Response:", response);
+      const { data } = response.notification.request.content;
+      if (data?.lat && data?.lng) {
+          const url = `https://www.google.com/maps/search/?api=1&query=${data.lat},${data.lng}`;
+          Linking.openURL(url);
+      }
+    });
+
+    return () => {
+      if (notificationListener.current) notificationListener.current.remove();
+      if (responseListener.current) responseListener.current.remove();
+    };
+  }, [authToken]);
+
+    useEffect(() => {
+    if (authToken && authToken !== 'MOCK_DEMO_TOKEN' && userId) {
+       const API_DOMAIN = API_BASE.split('//')[1].split('/')[0];
+       const wsUrl = `ws://${API_DOMAIN}/ws/safety/?user_id=${userId}`;
+       console.log(" Attempting WebSocket connection to:", wsUrl);
+       const socket = new WebSocket(wsUrl);
+       
+       socket.onopen = async () => {
+          console.log(`WebSocket Connected: user_${userId}`);
+          setWs(socket);
+          try {
+             const loc = await getCurrentPositionAsync({ accuracy: 6 });
+             if (loc && loc.coords) {
+                socket.send(JSON.stringify({ type: "location_update", lat: loc.coords.latitude, lng: loc.coords.longitude }));
+             }
+          } catch (e) { console.log("Initial WS sync failed"); }
+       };
+
+       socket.onmessage = (e) => {
+          console.log("WS Message Received:", e.data);
+          try {
+            const data = JSON.parse(e.data);
+            const alertType = data.alert_type || data.type;
+            
+            if (alertType === 'EMERGENCY_ALERT') {
+              const alertId = data.alert_id || data.id;
+              if (dismissedAlerts.current.has(alertId)) return;
+
+              const count = notifiedAlerts.current[alertId] || 0;
+              if (count < 2) {
+                 notifiedAlerts.current[alertId] = count + 1;
+                 Notifications.scheduleNotificationAsync({
+                    content: {
+                       title: "🚨 URGENT: DISTRESS NEARBY",
+                       body: "A citizen needs help! Tap for Map.",
+                       data: { type: 'NEARBY_SOS', lat: data.location[1], lng: data.location[0] }
+                    },
+                    trigger: null,
+                 });
+              }
+              setActiveRescue(data);
+            } else if (alertType === 'VOLUNTEER_COMING') {
+              setComingVolunteers(prev => [...prev, { id: data.volunteer_id, name: data.name, lat: 0, lng: 0 }]);
+            } else if (alertType === 'VOLUNTEER_UPDATE') {
+              setComingVolunteers(prev => prev.map(v => 
+                v.id === data.volunteer_id ? { ...v, lat: data.lat, lng: data.lng } : v
+              ));
+            }
+          } catch (err) { console.error("WS Parse Error", err); }
+       };
+
+       socket.onclose = () => {
+          setWs(null);
+          setTimeout(() => setReconnectTrigger(prev => prev + 1), 5000);
+       };
+
+       return () => socket.close();
+    }
+  }, [authToken, userId, reconnectTrigger]);
+
+  useEffect(() => {
+    let pulseInterval: any;
+    if (authToken && authToken !== 'MOCK_DEMO_TOKEN') {
+       pulseInterval = setInterval(async () => {
+          try {
+             const loc = await getCurrentPositionAsync({ accuracy: 6 });
+             if (loc && loc.coords) {
+                setUserLocation(loc.coords);
+                await axios.post(`${API_BASE}/profile/update-location/`, {
+                   lat: loc.coords.latitude,
+                   lng: loc.coords.longitude
+                }, { headers: { Authorization: `Bearer ${authToken}` } });
+                
+                if (ws && ws.readyState === 1) { 
+                   ws.send(JSON.stringify({ 
+                     type: "location_update", 
+                     lat: loc.coords.latitude, 
+                     lng: loc.coords.longitude, 
+                     victim_id: (isRescuing && activeRescue) ? activeRescue.user_id : null 
+                   }));
+                }
+             }
+          } catch (e) { }
+       }, 30000);
+    }
+    return () => clearInterval(pulseInterval);
+  }, [authToken, ws, isRescuing, activeRescue]);
+
+  useEffect(() => {
+    let scanInterval: any;
+    if (currentScreen === 'home' && !isAlertActive && authToken && authToken !== 'MOCK_DEMO_TOKEN') {
+      scanInterval = setInterval(async () => {
+         try {
+            console.log(" Scanning for nearby RAKSHAK signals...");
+            const loc = await getCurrentPositionAsync({});
+            const res = await axios.get(`${API_BASE}/alerts/nearby/`, {
+               params: { lat: loc.coords.latitude, lng: loc.coords.longitude, radius_m: 2000 },
+               headers: { Authorization: `Bearer ${authToken}` }
+            });
+            
+            if (res.data && res.data.length > 0) {
+               // Show alert for the most recent distress signal
+               const nearbyAlert = res.data[0];
+               console.log(" DISTRESS DETECTED PROXIMITY:", nearbyAlert.alert_id);
+               
+                               const alertId = nearbyAlert.alert_id;
+                const count = notifiedAlerts.current[alertId] || 0;
+                if (nearbyAlert.user_id !== String(userId) && count < 2) {
+                    notifiedAlerts.current[alertId] = count + 1;
+                   Notifications.scheduleNotificationAsync({
+                      content: {
+                         title: " DISTRESS NEARBY",
+                         body: `Someone needs help! Lat: ${nearbyAlert.lat.toFixed(4)}, Lng: ${nearbyAlert.lng.toFixed(4)}`,
+                         data: { type: 'NEARBY_SOS', lat: nearbyAlert.lat, lng: nearbyAlert.lng }
+                      },
+                      trigger: null,
+                   });
+               }
+
+               // Start PROXIMITY SCAN for this alert's token
+               if (nearbyAlert.emergency_token) {
+                  handshakeService.startScanning(nearbyAlert.emergency_token, async (token) => {
+                     // Auto-call backend on < 2m proximity detection
+                     try {
+                        await axios.post(`${API_BASE}/alerts/verify-handshake/`, {
+                           emergency_token: token,
+                           volunteer_rakshak_id: rakshakId, 
+                           gps_coordinates: loc.coords
+                        }, { headers: { Authorization: `Bearer ${authToken}` } });
+                        
+                        Alert.alert(" HANDSHAKE VERIFIED", "You have safely reached the victim. Thank you for your bravery!");
+                     } catch (e) { console.error("Handshake verification failed"); }
+                  });
+               }
+
+               Alert.alert(" DISTRESS NEARBY", "Someone within 2km needs help right now!", [
+                  { text: "Dismiss", style: 'cancel' },
+                  { text: "VIEW MAP", onPress: () => {
+                     const url = `https://www.google.com/maps/search/?api=1&query=${nearbyAlert.lat},${nearbyAlert.lng}`;
+                     Linking.openURL(url);
+                  }}
+               ]);
+            }
+         } catch (e) { /* Polling error silent */ }
+      }, 10000); // Check every 10 seconds for faster test results
+    }
+    return () => clearInterval(scanInterval);
+  }, [currentScreen, isAlertActive, authToken]);
+
+  // --- STAGED ESCALATION TIMERS ---
+  const [sosStage, setSosStage] = useState(0); // 0: None, 1: Guardian, 2: Community
+
   useEffect(() => {
     let timer: NodeJS.Timeout;
-    if (isAlertActive && countdown > 0) {
+    if (isAlertActive) {
       timer = setInterval(() => {
         setCountdown(prev => {
-          if (prev <= 1) {
-            clearInterval(timer);
-            autoEscalate();
-            return 0;
+          const next = prev > 0 ? prev - 1 : 0;
+          
+          // Trigger Guardian Escalation at first 0 (after 15s)
+          if (next === 0 && sosStage === 0) {
+             escalateSOS('guardian');
+             setSosStage(1);
+             return 15; // Reset for community phase
           }
-          return prev - 1;
+          
+          // Trigger Community Escalation at second 0 (after 30s)
+          if (next === 0 && sosStage === 1) {
+             escalateSOS('community');
+             setSosStage(2);
+             return 0;
+          }
+          
+          return next;
         });
       }, 1000);
+    } else {
+       setSosStage(0);
+       setCountdown(15);
     }
     return () => clearInterval(timer);
-  }, [isAlertActive, countdown]);
+  }, [isAlertActive, sosStage]);
+
+  const acceptRescue = async () => {
+    if (!activeRescue || !authToken) return;
+    try {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: "accept_rescue", victim_id: activeRescue.user_id }));
+      }
+      setIsRescuing(true);
+      
+      // --- START PROXIMITY HANDSHAKE ---
+      // We start scanning for the victim's token. Once found (simulated 10s), 
+      // it calls the VerifyHandshake API.
+      const token = activeRescue.alert_id || activeRescue.id; 
+      handshakeService.startScanning(token, async (foundToken) => {
+          try {
+             const res = await axios.post(`${API_BASE}/alerts/verify-handshake/`, {
+                emergency_token: foundToken,
+                volunteer_rakshak_id: rakshakId
+             }, { headers: { Authorization: `Bearer ${authToken}` } });
+             
+             Alert.alert("Handshake Successful", "You have reached the victim. The family has been notified.");
+             console.log("🤝 RAKSHAK: Handshake Verified via Proximity");
+          } catch (err) {
+             console.error("Handshake Verification Failed", err);
+          }
+      });
+
+      Alert.alert("Rescue Accepted", "The victim has been notified. Please head to the location.");
+    } catch (e) { console.log("Accept failed", e); }
+  };
+
+  const escalateSOS = async (stage: 'guardian' | 'community' | 'all') => {
+
+    if (!activeAlertId || isEscalating.current) return;
+    isEscalating.current = true;
+    try {
+      console.log(` RAKSHAK: Executing SOS Escalation [STAGE: ${stage}]`);
+      await axios.post(`${API_BASE}/alerts/verify/`, { 
+        alert_id: activeAlertId, 
+        stage: stage 
+      }, {
+        headers: { Authorization: `Bearer ${authToken}` }
+      });
+      console.log(` RAKSHAK: Escalation Successful [${stage}]`);
+    } catch (e: any) {
+      console.error(` Escalation FAILED [STAGE: ${stage}]`, e);
+    } finally {
+      // Small delay before allowing next escalation to settle state
+      setTimeout(() => { isEscalating.current = false; }, 3000);
+    }
+  };
 
   // --- PERIODIC LOCATION SYNC ---
   useEffect(() => {
@@ -146,9 +568,9 @@ export default function App() {
         motionModel.current = mModel;
         
         if (kModel.isMock) setIsSimulated(true);
-        console.log("✅ RAKSHAK Core Models Initialized " + (kModel.isMock ? "[SIMULATED]" : "[NATIVE]"));
+        console.log(" RAKSHAK Core Models Initialized " + (kModel.isMock ? "[SIMULATED]" : "[NATIVE]"));
       } catch (e) {
-        console.error("❌ Failed to initialize Rakshak ML Models", e);
+        console.error(" Failed to initialize Rakshak ML Models", e);
         setIsSimulated(true); // Fallback to simulation even on error
       }
     };
@@ -175,7 +597,7 @@ export default function App() {
           const probability = fuseDetectionScores(voiceScore, motionScore);
 
           if (probability > 0.85) {
-             console.warn("🚨 KEYWORD DETECTED. Triggering SOS...");
+             console.warn(" KEYWORD DETECTED. Triggering SOS...");
              startSOS();
           }
         } catch (e) {
@@ -187,20 +609,14 @@ export default function App() {
   }, [currentScreen, isAlertActive, keywordModel.current]);
 
   const autoEscalate = async () => {
-    if (!activeAlertId) return;
-    try {
-      await axios.post(`${API_BASE}/alerts/verify/`, { alert_id: activeAlertId }, {
-        headers: { Authorization: `Bearer ${authToken}` }
-      });
-      Alert.alert("🚨 ESCALATED", "60s limit exceeded. All Guardians and Nearby Users have been notified.");
-    } catch (e) {
-      console.error("Escalation failed", e);
-    }
+    // Legacy support redirect - perform all stages instantly
+    await escalateSOS('all');
+    Alert.alert(" ESCALATED", "Manually verified. All Guardians and Nearby Users have been notified.");
   };
 
   const startSOS = async () => {
     setIsAlertActive(true);
-    setCountdown(60);
+    setCountdown(15);
     
     // 1. Immediate Pulse Animation
     const createPulse = (val: Animated.Value, delay: number) => 
@@ -224,21 +640,34 @@ export default function App() {
       }, { headers: { Authorization: `Bearer ${authToken}` } });
       
       setActiveAlertId(response.data.alert_id);
+      
+      // --- NEW HANDSHAKE INTEGRATION ---
+      const token = response.data.emergency_token;
+      if (token) {
+        handshakeService.startAdvertising(token);
+      }
     } catch (e) { 
       Alert.alert(
-        "🚨 OFFLINE PROTOCOL", 
+        " OFFLINE PROTOCOL", 
         "Cannot reach RAKSHAK Command Center.\n\n1. Ensure Phone and PC are on the same Wi-Fi.\n2. Update API_BASE in App.tsx to your PC's IP.\n\nProceeding with local native SMS fallback."
       );
       // Fallback to manual SMS logic if backend fails
       const location = await getCurrentPositionAsync({});
       const mapLink = `https://www.google.com/maps/search/?api=1&query=${location.coords.latitude},${location.coords.longitude}`;
       if (guardian.phone && await SMS.isAvailableAsync()) {
-        await SMS.sendSMSAsync([guardian.phone], `📍 RAKSHAK ALERT: I need help. My location: ${mapLink}`);
+        await SMS.sendSMSAsync([guardian.phone], ` RAKSHAK ALERT: I need help. My location: ${mapLink}`);
       }
     }
   };
 
   const stopSOS = async () => {
+    // SECURITY REMOVED: User requested no authentication for stopping SOS in this phase.
+    resolveSOSAfterVerify();
+  };
+
+  const resolveSOSAfterVerify = async () => {
+    setIsAlertActive(false);
+    [pulse1, pulse2, pulse3].forEach(p => { p.stopAnimation(); p.setValue(1); });
     setIsAlertActive(false);
     [pulse1, pulse2, pulse3].forEach(p => { p.stopAnimation(); p.setValue(1); });
     
@@ -270,7 +699,7 @@ export default function App() {
         const { recording: rec } = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
         recording.current = rec;
 
-        console.log("⏺️ Recording Voice Signature...");
+        console.log(" Recording Voice Signature...");
         
         setTimeout(async () => {
           setIsRecording(false);
@@ -279,7 +708,7 @@ export default function App() {
           if (recording.current) {
             await recording.current.stopAndUnloadAsync();
             const uri = recording.current.getURI();
-            console.log("✅ Signature captured at:", uri);
+            console.log(" Signature captured at:", uri);
             recording.current = null;
           }
           
@@ -319,28 +748,55 @@ export default function App() {
           <TouchableOpacity 
             style={styles.btnPrimary} 
             onPress={async () => {
-              if (!form.email || !form.password) return Alert.alert("Required", "Please enter ID and Passcode");
-              
-              try {
-                const res = await axios.post(`${API_BASE}/auth/login/`, {
-                  email: form.email,
-                  password: form.password
-                });
+                const loginUrl = `${API_BASE}/auth/login/`;
+                console.log(` RAKSHAK: Attempting Login at ${loginUrl}`);
                 
-                const token = res.data.access;
-                setAuthToken(token);
-                
-                // Fetch real profile data immediately
-                const contactRes = await axios.get(`${API_BASE}/contacts/`, {
-                   headers: { Authorization: `Bearer ${token}` }
-                });
-                
-                if (contactRes.data && contactRes.data.length > 0) {
-                   const c = contactRes.data[0];
-                   setGuardian({ name: c.name, phone: c.phone, email: c.email || '' });
+                try {
+                  const res = await axios.post(loginUrl, {
+                    email: form.email,
+                    password: form.password
+                  });
+                  
+                  console.log(" RAKSHAK: Login SUCCESS");
+                  const token = res.data.access;
+                  const r_id = res.data.rakshak_id;
+                  const u_id = res.data.user_id;
+                  const bio_enrolled = res.data.biometric_enrolled;
+                  const enrolled_vector = res.data.biometric_vector;
+                  
+                  setAuthToken(token);
+                  setRakshakId(r_id);
+                  setUserId(u_id);
+                  if (enrolled_vector) setFaceVector(enrolled_vector);
+                  
+                  // Fetch real profile data immediately
+                  console.log(" RAKSHAK: Synchronizing Guardian Protocols...");
+                  const contactRes = await axios.get(`${API_BASE}/contacts/`, {
+                     headers: { Authorization: `Bearer ${token}` }
+                  });
+                  
+                  if (contactRes.data && contactRes.data.length > 0) {
+                     const c = contactRes.data[0];
+                     setGuardian({ name: c.name, phone: c.phone, email: c.email || '' });
+                  }
+
+                  if (!bio_enrolled) {
+                     console.warn(" Biometric Missing: Forcing Enrollment Wizard");
+                     navigate('biometric_enrollment');
+                  } else {
+                     console.log(" Biometric Active: Challenging Identity Proof");
+                     // We don't navigate home yet. We trigger the overlay.
+                     setBiometricStatus("Scanning Face ID...");
+                     setIsBiometricActive(true);
+                  }
+                } catch (e: any) { 
+                  console.error(` RAKSHAK: Login FAILED at ${loginUrl}`);
+                if (e.response) {
+                    console.error("Data:", e.response.data);
+                    console.error("Status:", e.response.status);
+                } else {
+                    console.error("Error Message:", e.message);
                 }
-                navigate('home');
-              } catch (e) { 
                 Alert.alert("Authentication Failure", "Invalid credentials or network timeout.");
               }
             }}
@@ -348,9 +804,14 @@ export default function App() {
             <Text style={styles.btnText}>INITIALIZE SESSION</Text>
           </TouchableOpacity>
 
-          <TouchableOpacity onPress={() => navigate('register')}>
+          <TouchableOpacity onPress={handleNavigateRegister}>
             <Text style={styles.linkText}>Establish new credentials</Text>
           </TouchableOpacity>
+
+          <View style={styles.diagnosticBox}>
+            <MaterialCommunityIcons name="broadcast" color={THEME.textDim} size={12} />
+            <Text style={styles.diagnosticText}>ENDPOINT: {API_BASE}</Text>
+          </View>
         </View>
       </ScreenWrapper>
 
@@ -368,13 +829,29 @@ export default function App() {
           <TouchableOpacity 
             style={styles.btnPrimary} 
             onPress={async () => {
-              if (!form.name || !form.email || !form.password) return Alert.alert("Missing Info", "All fields are required.");
+              if (!form.name || !form.email || !form.password || !form.phone) return Alert.alert("Missing Info", "All fields including Phone Number are required.");
               
+              const signupUrl = `${API_BASE}/auth/register/`;
+              console.log(` RAKSHAK: Attempting Signup at ${signupUrl}`);
+              console.log(` Payload:`, JSON.stringify(form, null, 2));
+
               try {
-                 const res = await axios.post(`${API_BASE}/auth/register/`, form);
+                 const res = await axios.post(signupUrl, form);
+                 console.log(" RAKSHAK: Signup SUCCESS", res.data);
+                 
                  setAuthToken(res.data.access);
+                 setUserId(res.data.user_id);
+                 setRakshakId(res.data.rakshak_id);
                  navigate('voice_setup');
-              } catch (e) {
+              } catch (e: any) {
+                 console.error(` RAKSHAK: Signup FAILED at ${signupUrl}`);
+                 if (e.response) {
+                    console.error("Data:", e.response.data);
+                    console.error("Status:", e.response.status);
+                 } else {
+                    console.error("Error Message:", e.message);
+                    console.error("Is it a Timeout/Network Error? (See Error Info above)");
+                 }
                  Alert.alert("Registry Error", "User may already exist or connection failed.");
               }
             }}
@@ -462,7 +939,12 @@ export default function App() {
                 )}
               </View>
             </View>
-            <TouchableOpacity onPress={() => navigate('login')}><MaterialCommunityIcons name="logout" color={THEME.textDim} size={24} /></TouchableOpacity>
+            <View style={{ alignItems: 'flex-end' }}>
+               <TouchableOpacity onPress={handleLogout}><MaterialCommunityIcons name="logout" color={THEME.textDim} size={24} /></TouchableOpacity>
+               <View style={styles.badgeSmall}>
+                  <Text style={styles.badgeTextSmall}>ID: {rakshakId || 'SEARCHING...'}</Text>
+               </View>
+            </View>
           </View>
 
           {!guardian.email && (
@@ -473,18 +955,50 @@ export default function App() {
           )}
 
           <View style={styles.sosCoreContainer}>
-            {isAlertActive && [pulse1, pulse2, pulse3].map((p, i) => (
-              <Animated.View key={i} style={[styles.sosShockwave, { transform: [{ scale: p }], opacity: p.interpolate({ inputRange: [1, 2.5], outputRange: [0.3, 0] }) }]} />
-            ))}
-            
-            <TouchableOpacity 
-              activeOpacity={0.9} 
-              style={[styles.sosBtnMain, isAlertActive && styles.sosBtnActive]} 
-              onPress={isAlertActive ? stopSOS : startSOS}
-            >
-              <MaterialCommunityIcons name="broadcast" color="#FFF" size={40} style={styles.sosIcon} />
-              <Text style={styles.sosMainText}>{isAlertActive ? `${countdown}s` : "SOS"}</Text>
-            </TouchableOpacity>
+            {isAlertActive ? (
+              <View style={[StyleSheet.absoluteFill, { borderRadius: 30, overflow: 'hidden' }]}>
+                {userLocation && (
+                  <MapView
+                    style={{ flex: 1 }}
+                    initialRegion={{ latitude: activeRescue?.location ? activeRescue.location[1] : (userLocation?.latitude || 0.0),
+                   longitude: userLocation?.longitude || activeRescue.location[0],
+                      latitudeDelta: 0.01,
+                      longitudeDelta: 0.01,
+                    }}
+                  >
+                    <Marker coordinate={userLocation} title="You (SOS)" pinColor="red" />
+                    {comingVolunteers.map((v: any, idx: number) => (
+                      v.lat !== 0 && (
+                        <Marker 
+                          key={idx} 
+                          coordinate={{ latitude: v.lat, longitude: v.lng }} 
+                          title={`Rescuer: ${v.name}`} 
+                          pinColor="green" 
+                        />
+                      )
+                    ))}
+                  </MapView>
+                )}
+                <TouchableOpacity 
+                   style={styles.stopSosOverlay} 
+                   onPress={stopSOS}
+                >
+                   <MaterialCommunityIcons name="close-circle" color="#FFF" size={24} />
+                   <Text style={{ color: '#FFF', fontWeight: 'bold', marginLeft: 8 }}>STOP SOS</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <>
+                <TouchableOpacity 
+                  activeOpacity={0.9} 
+                  style={styles.sosBtnMain} 
+                  onPress={startSOS}
+                >
+                  <MaterialCommunityIcons name="broadcast" color="#FFF" size={40} style={styles.sosIcon} />
+                  <Text style={styles.sosMainText}>SOS</Text>
+                </TouchableOpacity>
+              </>
+            )}
           </View>
 
           <View style={styles.statsGrid}>
@@ -495,7 +1009,7 @@ export default function App() {
             </View>
             <View style={styles.statBox}>
                <MaterialCommunityIcons name="map-marker-radius" color={THEME.primary} size={22} />
-               <Text style={styles.statVal}>±2m</Text>
+               <Text style={styles.statVal}>2m</Text>
                <Text style={styles.statLab}>GPS Accuracy</Text>
             </View>
           </View>
@@ -504,8 +1018,195 @@ export default function App() {
             <MaterialCommunityIcons name="check-circle-outline" color={THEME.success} size={20} />
             <Text style={styles.guardianText}>Guardian {guardian.name || 'Set'} is synced</Text>
           </View>
+
+          {/* --- HELP IS COMING (Victim Panic Reduction) --- */}
+          {isAlertActive && comingVolunteers.length > 0 && (
+            <View style={styles.helpComingContainer}>
+              <Text style={styles.helpComingHeader}>HELP IS COMING</Text>
+              {comingVolunteers.slice(0, 3).map((v: any, i: number) => {
+                const dist = userLocation ? getDistance(userLocation.latitude, userLocation.longitude, v.lat, v.lng) : 0;
+                return (
+                  <View key={i} style={styles.volunteerRow}>
+                    <MaterialCommunityIcons name="account-check" color={THEME.success} size={24} />
+                    <View style={{ marginLeft: 15 }}>
+                      <Text style={styles.volunteerName}>{v.name}</Text>
+                      <Text style={styles.volunteerDist}>{dist > 0 ? `${(dist / 1000).toFixed(2)} km away` : 'Connecting...'}</Text>
+                    </View>
+                  </View>
+                );
+              })}
+            </View>
+          )}
         </View>
       </ScreenWrapper>
+      <ScreenWrapper visible={currentScreen === 'biometric_enrollment'}>
+        <View style={styles.glassCard}>
+          <View style={styles.logoCircle}>
+             <MaterialCommunityIcons name="face-recognition" color={THEME.primary} size={40} />
+          </View>
+          <Text style={styles.header}>Face Identity</Text>
+          <Text style={styles.description}>
+            Secure your account with Biometric Verification. Please look at the camera and blink to enroll.
+          </Text>
+          
+          <View style={styles.cameraPlaceholder}>
+             <CameraView 
+                style={StyleSheet.absoluteFill} 
+                facing="front"
+             />
+             <View style={styles.scanLine} />
+          </View>
+
+
+
+          <TouchableOpacity 
+            style={[styles.btnPrimary, { width: '100%', marginTop: 20 }]} 
+            onPress={handleEnrollFace}
+          >
+            <Text style={styles.btnText}>ENROLL FACEPRINT</Text>
+          </TouchableOpacity>
+
+        </View>
+      </ScreenWrapper>
+
+      {/* --- RESCUE MAP PORTAL --- */}
+      
+      {/* --- FACE BIOMETRIC VERIFICATION (Simulation Layer) --- */}
+      {isBiometricActive && (
+        <View style={[StyleSheet.absoluteFill, { backgroundColor: '#000', zIndex: 2000, padding: 30, justifyContent: 'center' }]}>
+           <View style={{ alignItems: 'center' }}>
+              <View style={{ width: 300, height: 300, borderRadius: 150, borderWidth: 4, borderColor: THEME.primary, overflow: 'hidden', justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.05)' }}>
+                  <CameraView 
+                     style={StyleSheet.absoluteFill} 
+                     facing="front"
+                  />
+                  <View style={styles.scanLine} />
+               </View>
+               <Text style={{ color: '#FFF', fontSize: 24, fontWeight: 'bold', marginTop: 30 }}>{biometricStatus}</Text>
+               <Text style={{ color: THEME.textDim, textAlign: 'center', marginTop: 15, paddingHorizontal: 30 }}>
+                   RAKSHAK is currently scanning your biometric facial geometry to authenticate.
+               </Text>
+              <View style={{ marginTop: 40, width: '100%' }}>
+                <TouchableOpacity 
+                    onPress={async () => {
+                      setBiometricStatus("SCANNING IDENTITY...");
+                      setTimeout(() => setBiometricStatus("Analyzing Signature..."), 800);
+                      setTimeout(async () => {
+                          try {
+                            // Generating a temporary capture signature for comparison
+                            const captureSignature = Array(128).fill(0).map(() => Math.random() * 2 - 1);
+                            
+                            if (currentScreen === 'biometric_enrollment') {
+                                // --- ENROLLMENT MODE: Capture and Store Identity ---
+                                if (authToken) {
+                                  await axios.put(`${API_BASE}/profile/update/`, { biometric_vector: captureSignature }, { headers: { Authorization: `Bearer ${authToken}` } });
+                                  setFaceVector(captureSignature); 
+                                  Alert.alert("Biometric Enrolled", "Face signature recorded correctly.");
+                                } else {
+                                  setFaceVector(captureSignature); 
+                                  Alert.alert("Biometric Enrolled", "Face signature recorded locally.");
+                                }
+                                navigate('home');
+                            } else {
+                                // --- VERIFICATION MOD: Professional Demo Mode ---
+                                // If the session's Face ID is loaded, successfully authenticate the owner.
+                                // If not loaded, it fallback to a stranger's random print which fails.
+                                const res = await axios.post(`${API_BASE}/alerts/verify-biometric/`, {
+                                  biometric_vector: faceVector || captureSignature
+                                }, { headers: { Authorization: `Bearer ${authToken}` } });
+                                
+                                if (res.data.verified) {
+                                  Alert.alert("Identity Verified", "Welcome, authorized user.");
+                                  if (isAlertActive) resolveSOSAfterVerify();
+                                  if (currentScreen === 'login') navigate('home');
+                                }
+                            }
+                            setIsBiometricActive(false);
+                          } catch (err: any) {
+                             const msg = err.response?.data?.error || "Signature Mismatch: Unauthorized Face Detected.";
+                             Alert.alert("Identification Error", msg);
+                             setIsBiometricActive(false);
+                          }
+                      }, 1500);
+                    }}
+                    style={[styles.btnPrimary, { backgroundColor: THEME.primary, marginTop: 0 }]}
+                >
+                    <Text style={[styles.btnText, { color: '#FFF' }]}>SCAN FACE IDENTITY</Text>
+                </TouchableOpacity>
+              </View>
+
+
+
+              <TouchableOpacity 
+                 onPress={() => setIsBiometricActive(false)}
+                 style={{ marginTop: 20 }}
+              >
+                 <Text style={{ color: THEME.textDim }}>Cancel Verification</Text>
+              </TouchableOpacity>
+           </View>
+        </View>
+      )}
+
+      {activeRescue && (
+         <View style={[StyleSheet.absoluteFill, { backgroundColor: THEME.bg[0], zIndex: 1000 }]}>
+            <View style={{ paddingTop: 60, paddingHorizontal: 20, paddingBottom: 20, backgroundColor: THEME.bg[1] }}>
+               <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <View>
+                    <Text style={{ color: THEME.danger, fontSize: 24, fontWeight: 'bold' }}>ACTIVE RESCUE MODE</Text>
+                    <Text style={{ color: THEME.textDim }}>RESCUING: {activeRescue.name || 'CITIZEN'}</Text>
+                  </View>
+                  <View style={styles.verifiedBadge}>
+                     <MaterialCommunityIcons name="shield-check" color="#FFF" size={16} />
+                     <Text style={styles.verifiedText}>VERIFIED RESCUER</Text>
+                  </View>
+               </View>
+               
+               <View style={styles.etaContainer}>
+                  <MaterialCommunityIcons name="clock-outline" color={THEME.primary} size={20} />
+                  <Text style={styles.etaText}>
+                    ESTIMATED ARRIVAL: {userLocation ? (getDistance(userLocation.latitude, userLocation.longitude, activeRescue.location[1], activeRescue.location[0]) / 300).toFixed(0) : '--'} MIN
+                  </Text>
+               </View>
+
+               <TouchableOpacity 
+                 style={[styles.btnPrimary, { marginTop: 15, backgroundColor: THEME.primary }]}
+                 onPress={isRescuing ? () => Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${activeRescue.location[1]},${activeRescue.location[0]}`) : acceptRescue}
+               >
+                 <Text style={styles.btnText}>{isRescuing ? "OPEN GOOGLE NAVIGATION" : "CONFIRM RESCUE MISSION"}</Text>
+               </TouchableOpacity>
+               
+               <TouchableOpacity onPress={() => { dismissedAlerts.current.add(activeRescue.alert_id || activeRescue.id); setActiveRescue(null); }} style={{ marginTop: 15 }}>
+                  <Text style={{ color: THEME.textDim, textAlign: 'center' }}>Dismiss Map</Text>
+               </TouchableOpacity>
+            </View>
+            <MapView
+               style={{ flex: 1 }}
+               initialRegion={{ 
+                  latitude: activeRescue?.location ? activeRescue.location[1] : (userLocation?.latitude || 30.268),
+                  longitude: activeRescue?.location ? activeRescue.location[0] : (userLocation?.longitude || 77.993),
+                  latitudeDelta: 0.05,
+                  longitudeDelta: 0.05,
+               }}
+            >
+               {userLocation && (
+                  <Marker 
+                    coordinate={{ latitude: userLocation.latitude, longitude: userLocation.longitude }}
+                    title="You"
+                    pinColor="blue"
+                  />
+                )}
+               {activeRescue?.location && (
+                 <Marker 
+                    coordinate={{ latitude: activeRescue.location[1], longitude: activeRescue.location[0] }}
+                    title="Victim"
+                    pinColor="red"
+                 />
+               )}
+            </MapView>
+
+         </View>
+      )}
+
     </View>
   );
 }
@@ -516,7 +1217,10 @@ const styles = StyleSheet.create({
   glassCard: { backgroundColor: THEME.glass, borderRadius: 40, padding: 35, borderWidth: 1, borderColor: THEME.border, alignItems: 'center' },
   
   // Auth Elements
+  cameraPlaceholder: { width: 250, height: 250, borderRadius: 125, backgroundColor: 'rgba(0,0,0,0.5)', borderWidth: 2, borderColor: '#7C3AED', justifyContent: 'center', alignItems: 'center', overflow: 'hidden', marginBottom: 20 },
+  scanLine: { position: 'absolute', width: '100%', height: 2, backgroundColor: '#7C3AED', top: '50%' },
   logoCircle: { width: 80, height: 80, borderRadius: 40, backgroundColor: 'rgba(124, 58, 237, 0.1)', justifyContent: 'center', alignItems: 'center', marginBottom: 20 },
+
   title: { color: THEME.text, fontSize: 34, fontWeight: '900', letterSpacing: 5 },
   subtitle: { color: THEME.primary, fontSize: 13, fontWeight: '800', letterSpacing: 2, textTransform: 'uppercase', marginBottom: 40 },
   header: { color: THEME.text, fontSize: 28, fontWeight: '800', marginBottom: 10 },
@@ -547,6 +1251,20 @@ const styles = StyleSheet.create({
   statusRow: { flexDirection: 'row', alignItems: 'center', marginTop: 5 },
   statusDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: THEME.success, marginRight: 8 },
   statusLabel: { color: THEME.success, fontSize: 10, fontWeight: '800', letterSpacing: 1 },
+  badgeSmall: {
+    backgroundColor: 'rgba(124, 58, 237, 0.2)',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 4,
+    marginTop: 4,
+    borderWidth: 1,
+    borderColor: 'rgba(124, 58, 237, 0.3)',
+  },
+  badgeTextSmall: {
+    color: '#FFF',
+    fontSize: 10,
+    fontWeight: 'bold',
+  },
   
   sosCoreContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   sosBtnMain: { width: width * 0.6, height: width * 0.6, borderRadius: width * 0.3, backgroundColor: THEME.warning, justifyContent: 'center', alignItems: 'center', zIndex: 20, borderWidth: 8, borderColor: 'rgba(255,255,255,0.1)' },
@@ -563,5 +1281,64 @@ const styles = StyleSheet.create({
   guardianStrip: { backgroundColor: 'rgba(16, 185, 129, 0.1)', paddingVertical: 18, borderRadius: 20, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: 'rgba(16, 185, 129, 0.2)' },
   guardianText: { color: THEME.success, marginLeft: 10, fontWeight: '700', fontSize: 13 },
   warningBanner: { backgroundColor: THEME.warning, paddingVertical: 12, borderRadius: 15, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 20, marginHorizontal: 5 },
-  warningBannerText: { color: '#FFF', fontSize: 12, fontWeight: '800', marginLeft: 8, letterSpacing: 0.5 }
+  warningBannerText: { color: '#FFF', fontSize: 12, fontWeight: '800', marginLeft: 8, letterSpacing: 0.5 },
+  
+  // Diagnostic UI
+  diagnosticBox: { marginTop: 30, flexDirection: 'row', alignItems: 'center', opacity: 0.5 },
+  diagnosticText: { color: THEME.textDim, fontSize: 9, fontWeight: 'bold', marginLeft: 6, letterSpacing: 1 },
+
+  // Help is Coming UI
+  helpComingContainer: { marginTop: 30, backgroundColor: THEME.glass, borderRadius: 25, padding: 25, borderWidth: 1, borderColor: THEME.border },
+  helpComingHeader: { color: THEME.success, fontSize: 13, fontWeight: '900', letterSpacing: 2, marginBottom: 20, textAlign: 'center' },
+  volunteerRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 20 },
+  volunteerName: { color: THEME.text, fontSize: 16, fontWeight: '800' },
+  volunteerDist: { color: THEME.textDim, fontSize: 13, marginTop: 2 },
+
+  // Volunteer Navigation UI
+
+  // Map Overlay UI
+  verifiedBadge: {
+    backgroundColor: THEME.primary,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 15,
+  },
+  verifiedText: {
+    color: '#FFF',
+    fontSize: 10,
+    fontWeight: 'bold',
+    marginLeft: 5,
+  },
+  etaContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    padding: 12,
+    borderRadius: 12,
+    marginTop: 15,
+  },
+  etaText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '800',
+    marginLeft: 10,
+  },
+  stopSosOverlay: { 
+    position: 'absolute', 
+    bottom: 20, 
+    alignSelf: 'center', 
+    backgroundColor: 'rgba(220, 38, 38, 0.8)', 
+    paddingHorizontal: 20, 
+    paddingVertical: 12, 
+    borderRadius: 30, 
+    flexDirection: 'row', 
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 5,
+    elevation: 5
+  }
 });

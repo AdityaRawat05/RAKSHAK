@@ -22,9 +22,15 @@
       "package": "com.rakshak.mobile",
       "permissions": [
         "ACCESS_BACKGROUND_LOCATION",
+        "ACCESS_FINE_LOCATION",
         "FOREGROUND_SERVICE",
         "RECORD_AUDIO",
-        "READ_CONTACTS"
+        "READ_CONTACTS",
+        "BLUETOOTH",
+        "BLUETOOTH_ADMIN",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_ADVERTISE",
+        "BLUETOOTH_CONNECT"
       ]
     },
     "web": {
@@ -60,8 +66,7 @@
           "contactsPermission": "RAKSHAK needs contacts to set up your trusted contacts list."
         }
       ],
-      "expo-secure-store",
-      "react-native-fast-tflite"
+      "expo-secure-store"
     ],
     "scheme": "rakshak"
   }
