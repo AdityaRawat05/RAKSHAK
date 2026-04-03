@@ -10,7 +10,7 @@ def test_signup():
     payload = {
         "name": f"Test User {UNIQUE_ID}",
         "email": f"test_{UNIQUE_ID}@rakshak.ai",
-        "phone": "9988776655",
+        "phone": f"99887766{UNIQUE_ID[-2:]}",
         "password": "password123"
     }
     
