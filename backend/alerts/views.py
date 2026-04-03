@@ -235,12 +235,16 @@ class VerifyHandshakeView(APIView):
             return Response({"error": "Missing token or ID"}, status=status.HTTP_400_BAD_REQUEST)
             
         try:
-            incident = Incident.objects.filter(emergency_token=token, status='Active').first()
+            # Expand to allow both Active and Verified (in case of double-ping)
+            incident = Incident.objects.filter(emergency_token=token, status__in=['Active', 'Verified']).first()
         except Exception:
             return Response({"error": "Invalid token format"}, status=status.HTTP_400_BAD_REQUEST)
             
         if not incident:
-            return Response({"error": "Active incident with this token not found"}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"error": "Valid incident with this token not found"}, status=status.HTTP_404_NOT_FOUND)
+            
+        if incident.status == 'Verified':
+             return Response({"message": "Handshake already verified.", "victim_name": incident.victim.username}, status=status.HTTP_200_OK)
         profile = RakshakProfile.objects.filter(rakshak_id=rescuer_rakshak_id).first()
         if not profile:
             return Response({"error": "Rescuer profile not found"}, status=status.HTTP_404_NOT_FOUND)
@@ -355,9 +359,11 @@ class UploadEvidenceChunkView(APIView):
         lat = request.data.get('lat')
         lng = request.data.get('lng')
 
-        incident = Incident.objects.filter(emergency_token=token, status='Active').first()
+        # Accept chunks for both Active and Verified (handover phase)
+        incident = Incident.objects.filter(emergency_token=token, status__in=['Active', 'Verified']).first()
         if not incident:
-            return Response({"error": "Incident not found"}, status=status.HTTP_404_NOT_FOUND)
+            logger.warning(f" [UPLOAD-CHUNK] 404: Incident not found for token {token} (sequence: {sequence})")
+            return Response({"error": "Incident not found or resolved"}, status=status.HTTP_404_NOT_FOUND)
 
         if not file_obj:
             from django.core.files.base import ContentFile

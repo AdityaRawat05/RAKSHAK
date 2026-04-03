@@ -110,7 +110,12 @@ class LoginView(APIView):
             django_user.save()
             
         # Ensure RakshakProfile exists for handshakes
-        rakshak_profile, _ = RakshakProfile.objects.get_or_create(user=django_user)
+        from .signals import generate_rakshak_id
+        rakshak_profile, p_created = RakshakProfile.objects.get_or_create(user=django_user)
+        if p_created or not rakshak_profile.rakshak_id:
+            rakshak_profile.rakshak_id = generate_rakshak_id()
+            rakshak_profile.save()
+            
         rakshak_id = rakshak_profile.rakshak_id
         user_id = str(user_doc["_id"])
         
