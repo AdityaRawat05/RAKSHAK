@@ -9,6 +9,10 @@ from rest_framework.permissions import IsAuthenticated
 from django.utils.decorators import method_decorator
 from django_ratelimit.decorators import ratelimit
 import uuid
+from core.supabase_client import supabase
+from decouple import config
+
+BUCKET_NAME = config("SUPABASE_BUCKET_NAME", default="RakshakBucket")
 
 class KeywordUploadView(APIView):
     permission_classes = [IsAuthenticated]
@@ -30,25 +34,30 @@ class KeywordUploadView(APIView):
         user_doc = users_col.find_one({"_id": ObjectId(user_id)})
         user_name = user_doc.get("name", "UnknownUser").replace(" ", "_")
 
-        # Save to disk as raw bytes (No Encryption)
+        # Save to Supabase Storage
         raw_bytes = audio_file.read()
         
         # Determine extension
         ext = audio_file.name.split('.')[-1] if '.' in audio_file.name else 'bin'
         filename = f"{user_name}_KEYWORD_{uuid.uuid4().hex[:8]}.{ext}"
-        file_path = os.path.join(settings.MEDIA_ROOT, 'keywords', filename)
+        storage_path = f"keywords/{filename}"
         
-        # Ensure directories exist
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        
-        with open(file_path, 'wb') as f:
-            f.write(raw_bytes)
+        try:
+            supabase.storage.from_(BUCKET_NAME).upload(
+                path=storage_path,
+                file=raw_bytes,
+                file_options={"content-type": audio_file.content_type}
+            )
+            public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(storage_path)
+        except Exception as e:
+            return Response({"error": f"Supabase Upload Failed: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         # Update metadata in DB
         doc = {
             "user_id": user_id,
             "user_name": user_name,
-            "file_path": file_path,
+            "storage_path": storage_path,
+            "public_url": public_url,
             "filename": filename,
             "encrypted": False
         }
@@ -80,18 +89,24 @@ class EvidenceUploadView(APIView):
         # Determine extension
         ext = evidence_file.name.split('.')[-1] if '.' in evidence_file.name else 'bin'
         filename = f"{user_name}_SOS_{alert_id[:8]}_{uuid.uuid4().hex[:6]}.{ext}"
-        file_path = os.path.join(settings.MEDIA_ROOT, 'evidence', filename)
+        storage_path = f"evidence/{filename}"
         
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        
-        with open(file_path, 'wb') as f:
-            f.write(raw_bytes)
+        try:
+            supabase.storage.from_(BUCKET_NAME).upload(
+                path=storage_path,
+                file=raw_bytes,
+                file_options={"content-type": evidence_file.content_type}
+            )
+            public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(storage_path)
+        except Exception as e:
+            return Response({"error": f"Supabase Upload Failed: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         doc = {
             "user_id": user_id,
             "user_name": user_name,
             "alert_id": alert_id,
-            "file_path": file_path,
+            "storage_path": storage_path,
+            "public_url": public_url,
             "filename": filename,
             "encrypted": False
         }
@@ -130,9 +145,9 @@ class EvidenceDetailView(APIView):
             if not doc:
                 return Response({"error": "Evidence not found or unauthorized"}, status=status.HTTP_404_NOT_FOUND)
                 
-            # Erase file
-            if os.path.exists(doc['file_path']):
-                os.remove(doc['file_path'])
+            # Erase file from Supabase
+            if doc.get('storage_path'):
+                supabase.storage.from_(BUCKET_NAME).remove([doc['storage_path']])
                 
             evidence_col.delete_one({"_id": ObjectId(evidence_id)})
             
