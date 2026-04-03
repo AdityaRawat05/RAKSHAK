@@ -115,7 +115,8 @@ class EvidenceUploadView(APIView):
         
         return Response({
             "message": "Evidence uploaded securely",
-            "evidence_id": str(result.inserted_id)
+            "evidence_id": str(result.inserted_id),
+            "public_url": public_url
         }, status=status.HTTP_201_CREATED)
 
 class EvidenceListView(APIView):

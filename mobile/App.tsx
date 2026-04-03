@@ -130,6 +130,7 @@ export default function App() {
   const isEscalating = useRef(false);
   const dismissedAlerts = useRef<Set<string>>(new Set());
   const emergencyTokenRef = useRef<string | null>(null);
+  const activeAlertIdRef = useRef<string | null>(null);
   const evidenceCameraRef = useRef<CameraView>(null);
 
   // WebSocket Integration
@@ -665,7 +666,9 @@ export default function App() {
         threat_level: 'CRITICAL'
       }, { headers: { Authorization: `Bearer ${authToken}` } });
       
-      setActiveAlertId(response.data.alert_id);
+      const alert_id = response.data.alert_id;
+      setActiveAlertId(alert_id);
+      activeAlertIdRef.current = alert_id;
       const eToken = response.data.emergency_token;
       setActiveEmergencyToken(eToken);
       emergencyTokenRef.current = eToken;
@@ -684,52 +687,65 @@ export default function App() {
     gpsInterval.current = setInterval(async () => {
        try {
          const loc = await getCurrentPositionAsync({ accuracy: 6 });
-         if (activeAlertId) {
+         if (activeAlertIdRef.current) {
             await axios.put(`${API_BASE}/profile/update/`, {
               location: { lat: loc.coords.latitude, lng: loc.coords.longitude }
             }, { headers: { Authorization: `Bearer ${authToken}` } });
          }
        } catch (e) {}
     }, 5000);
-
-    // 4. Recursive 5-second Video Chunker (Live Evidence Stream via Camera)
     let sequence = 0;
     const captureAndUpload = async () => {
        if (!emergencyTokenRef.current) return;
        try {
          const loc = await getCurrentPositionAsync({ accuracy: 6 });
          sequence++;
-         console.log(` [CHUNK #${sequence}] Recording 5s Evidence Segment via Camera...`);
-         
-         const normalizedToken = (emergencyTokenRef.current || '').toString().trim().toLowerCase();
-         const formData = new FormData();
-         formData.append('emergency_token', normalizedToken);
-         formData.append('sequence', sequence.toString());
-         formData.append('lat', loc.coords.latitude.toString());
-         formData.append('lng', loc.coords.longitude.toString());
+         console.log(` [CHUNK #${sequence}] Recording 5s Evidence Segment...`);
          
          if (evidenceCameraRef.current) {
             const video = await evidenceCameraRef.current.recordAsync({ maxDuration: 5 });
             if (video && video.uri) {
-                formData.append('file', {
+                const fileToUpload = {
                    uri: video.uri,
                    name: `chunk_${sequence}.mp4`,
                    type: 'video/mp4'
-                } as any);
+                } as any;
+
+                // --- PHASE 1: UPLOAD TO SUPABASE ---
+                console.log(` [CHUNK #${sequence}] Phase 1: Uploading to Supabase...`);
+                const cloudFormData = new FormData();
+                cloudFormData.append('alert_id', activeAlertIdRef.current || '');
+                cloudFormData.append('file', fileToUpload);
+                
+                const cloudRes = await axios.post(`${API_BASE}/evidence/upload/`, cloudFormData, {
+                   headers: { 'Content-Type': 'multipart/form-data', Authorization: `Bearer ${authToken}` }
+                });
+
+                const supabaseUrl = cloudRes.data.public_url;
+                console.log(` [CHUNK #${sequence}] ✅ Supabase Upload Success: ${supabaseUrl}`);
+
+                // --- PHASE 2: NOTIFY LIVE TRACKER (HANDSHAKE) ---
+                console.log(` [CHUNK #${sequence}] Phase 2: Updating Live Tracker...`);
+                const pulseData = new FormData();
+                const normalizedToken = (emergencyTokenRef.current || '').toString().trim().toLowerCase();
+                pulseData.append('emergency_token', normalizedToken);
+                pulseData.append('sequence', sequence.toString());
+                pulseData.append('lat', loc.coords.latitude.toString());
+                pulseData.append('lng', loc.coords.longitude.toString());
+                pulseData.append('remote_url', supabaseUrl); // Pass the Supabase link
+
+                await axios.post(`${API_BASE}/alerts/upload-chunk/`, pulseData, {
+                   headers: { 'Content-Type': 'multipart/form-data', Authorization: `Bearer ${authToken}` }
+                });
+                console.log(` [CHUNK #${sequence}] ✅ Dashboard Notified.`);
             }
          } else {
-            // Camera not mounted yet, fallback wait
             await new Promise(r => setTimeout(r, 5000));
          }
 
-         if (emergencyTokenRef.current) {
-            await axios.post(`${API_BASE}/alerts/upload-chunk/`, formData, {
-               headers: { 'Content-Type': 'multipart/form-data', Authorization: `Bearer ${authToken}` }
-            });
-         }
        } catch (e) {
-           console.error(" Chunk Stream Error:", e);
-           await new Promise(r => setTimeout(r, 2000)); // Delay retry on error
+           console.error(" Chunk Handshake Error:", e);
+           await new Promise(r => setTimeout(r, 2000));
        }
        if (emergencyTokenRef.current) captureAndUpload();
     };

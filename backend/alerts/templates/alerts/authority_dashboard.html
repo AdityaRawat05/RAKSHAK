@@ -94,15 +94,17 @@
         // Initial Load of Active Alerts
         async function fetchInitialAlerts() {
             try {
-                // We use the same admin endpoint for simplicity
-                const response = await fetch('/api/alerts/admin/list/', {
-                    headers: { 'Authorization': `Bearer ${localStorage.getItem('rakshak_admin_token')}` }
-                });
+                // SessionAuthentication handles the cookies automatically now
+                const response = await fetch('/api/alerts/admin/list/');
                 if (response.ok) {
                     const alerts = await response.json();
-                    alerts.forEach(handleSOSStart);
+                    if (alerts.length > 0) {
+                        alerts.forEach(handleSOSStart);
+                    }
                 }
-            } catch (e) { console.error("Initial load failed", e); }
+            } catch (e) { 
+                console.error("Dashboard Sync Failed", e); 
+            }
         }
 
         // WebSocket Setup
@@ -137,6 +139,8 @@
             setInterval(fetchInitialAlerts, 5000);
         }
 
+        let playedChunks = new Set();
+
         function handleSOSStart(data) {
             document.getElementById('alert-banner').classList.remove('hidden');
             siren.play();
@@ -157,9 +161,17 @@
             polyline.addLatLng(pos);
 
             logEvent(`SOS TRIGGERED: ${data.victim_name || 'A Rakshak User'}`, 'SOS_START');
+
+            // Handle Video Chunk from Polling/Initial Load
+            if (data.latest_chunk_url && !playedChunks.has(data.latest_chunk_url)) {
+                handleNewChunk({ chunk_url: data.latest_chunk_url, sequence: 'Live' });
+            }
         }
 
         function handleNewChunk(data) {
+            if (!data.chunk_url || playedChunks.has(data.chunk_url)) return;
+            playedChunks.add(data.chunk_url);
+
             if (data.lat && data.lng) {
                 const pos = [data.lat, data.lng];
                 polyline.addLatLng(pos);
@@ -170,7 +182,8 @@
             videoQueue.push(data.chunk_url);
             if (!isPlaying) playNextChunk();
 
-            logEvent(`Evidence Chunk #${data.sequence} Received`, 'VIDEO', data.chunk_url);
+            const seq = data.sequence || 'Live';
+            logEvent(`Evidence Chunk #${seq} Received`, 'VIDEO', data.chunk_url);
         }
 
         fetchInitialAlerts();

@@ -27,7 +27,16 @@ logger = logging.getLogger('django')
 
 class IsAdminUser(permissions.BasePermission):
     def has_permission(self, request, view):
-        return bool(request.user and hasattr(request.user, 'is_admin') and request.user.is_admin)
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        
+        # Support both custom PyMongo users (is_admin) and standard Django Admins (is_staff)
+        return (
+            getattr(user, 'is_admin', False) or 
+            getattr(user, 'is_staff', False) or 
+            getattr(user, 'is_superuser', False)
+        )
 
 class AuthorityDashboardView(TemplateView):
     template_name = 'alerts/authority_dashboard.html'
@@ -48,7 +57,7 @@ class AlertTriggerView(APIView):
         
         alert_doc = {
             "user_id": user_id,
-            "status": "created",
+            "status": "active",
             "lat": float(lat) if lat else 0.0,
             "lng": float(lng) if lng else 0.0,
             "threat_level": threat_level,
@@ -354,37 +363,46 @@ class UploadEvidenceChunkView(APIView):
 
     def post(self, request):
         token = request.data.get('emergency_token')
+        if not token or token == "":
+            return Response({"error": "emergency_token is required"}, status=status.HTTP_400_BAD_REQUEST)
+        
         sequence = request.data.get('sequence', 0)
         file_obj = request.FILES.get('file')
         lat = request.data.get('lat')
         lng = request.data.get('lng')
+        remote_url = request.data.get('remote_url')  # New: Supabase URL from app
 
         # Accept chunks for both Active and Verified (handover phase)
-        incident = Incident.objects.filter(emergency_token=token, status__in=['Active', 'Verified']).first()
+        try:
+            incident = Incident.objects.filter(emergency_token=token, status__in=['Active', 'Verified']).first()
+        except (ValueError, Exception):
+            return Response({"error": "Invalid emergency token format"}, status=status.HTTP_400_BAD_REQUEST)
+            
         if not incident:
             logger.warning(f" [UPLOAD-CHUNK] 404: Incident not found for token {token} (sequence: {sequence})")
             return Response({"error": "Incident not found or resolved"}, status=status.HTTP_404_NOT_FOUND)
 
-        if not file_obj:
-            from django.core.files.base import ContentFile
-            file_obj = ContentFile(b"Mock video chunk for pipeline testing", name=f"chunk_{sequence}.mp4")
+        # 1. Save locally only if a file was actually provided
+        chunk_local_url = None
+        if file_obj:
+            chunk = EvidenceChunk.objects.create(
+                incident=incident,
+                chunk_file=file_obj,
+                sequence_number=sequence
+            )
+            chunk_local_url = chunk.chunk_file.url
 
-        chunk = EvidenceChunk.objects.create(
-            incident=incident,
-            chunk_file=file_obj,
-            sequence_number=sequence
-        )
-
+        # 2. Update Location Tracking
         if lat and lng:
-            # 1. Update SQLite History
+            # Update SQLite History
             IncidentLocation.objects.create(incident=incident, lat=lat, lng=lng)
             
-            # 2. Update Primary Incident Record
+            # Update Primary Incident Record
             incident.last_lat = float(lat)
             incident.last_lng = float(lng)
             incident.save()
             
-            # 3. Sync to MongoDB (for Polling Dashboard)
+            # Sync to MongoDB (for Polling Dashboard)
             if incident.mongo_alert_id:
                 from core.db import alerts_col
                 from bson.objectid import ObjectId
@@ -392,6 +410,10 @@ class UploadEvidenceChunkView(APIView):
                     {"_id": ObjectId(incident.mongo_alert_id)},
                     {"$set": {"lat": float(lat), "lng": float(lng)}}
                 )
+
+        # 3. Broadcast to Dashboard (Prioritize the remote_url if provided)
+        # Using Supabase URL for dashboard playback
+        final_video_url = remote_url or (chunk_local_url if chunk_local_url else None)
 
         channel_layer = get_channel_layer()
         async_to_sync(channel_layer.group_send)(
@@ -401,16 +423,16 @@ class UploadEvidenceChunkView(APIView):
                 "payload": {
                     "type": "NEW_CHUNK",
                     "incident_id": incident.id,
-                    "chunk_url": chunk.chunk_file.url,
+                    "chunk_url": final_video_url,
                     "sequence": sequence,
                     "lat": float(lat) if lat else None,
                     "lng": float(lng) if lng else None,
-                    "timestamp": chunk.timestamp.isoformat()
+                    "timestamp": datetime.utcnow().isoformat()
                 }
             }
         )
 
-        return Response({"status": "Chunk Uploaded"}, status=status.HTTP_201_CREATED)
+        return Response({"status": "Pulse Received", "video_synced": bool(final_video_url)}, status=status.HTTP_200_OK)
 
 class AlertResolveView(APIView):
     permission_classes = [IsAuthenticated]
@@ -451,6 +473,12 @@ class AdminAlertListView(APIView):
                     pass
             
             alert["user_name"] = user_doc.get("name", "Unknown User") if user_doc else "Unknown User"
+            
+            # Fetch Latest Video Chunk (for Polling/Fallback)
+            from .models import EvidenceChunk
+            latest_chunk = EvidenceChunk.objects.filter(incident=incident).order_by('-timestamp').first()
+            alert["latest_chunk_url"] = latest_chunk.chunk_file.url if latest_chunk else None
+            
         return Response(active_alerts, status=status.HTTP_200_OK)
 
 class AdminDashboardView(TemplateView):
