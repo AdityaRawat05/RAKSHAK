@@ -175,12 +175,22 @@ class AlertVerifyView(APIView):
                     contact_phones = [c["phone"] for c in contacts if c.get("phone")]
                     contact_users = users_col.find({"phone": {"$in": contact_phones}})
                     for contact_user in contact_users:
+                        # Ensure we do not send the SOS to the person who triggered it
+                        if str(contact_user.get("_id")) == str(user_doc.get("_id")):
+                            continue
+                            
                         if contact_user.get("expo_push_token"):
                             send_expo_push(
                                 contact_user["expo_push_token"],
                                 "🚨 EMERGENCY ALERT",
-                                f"{user_doc.get('name')} is in danger!",
-                                {"alert_id": alert_id, "type": "EMERGENCY"}
+                                f"{user_doc.get('name')} is in danger! Location attached.",
+                                {
+                                    "alert_id": alert_id, 
+                                    "type": "EMERGENCY",
+                                    "lat": lat,
+                                    "lng": lng,
+                                    "map_link": map_link
+                                }
                             )
                 except Exception as g_err:
                     logger.error(f"Guardian Dispatch Error: {g_err}")
@@ -203,6 +213,11 @@ class AlertVerifyView(APIView):
                             
                             for user_data in nearby_users:
                                 u_id = str(user_data.get("_id"))
+                                
+                                # STRICT EXCLUSION: Do not send the rescue notification to the victim
+                                if str(u_id) == str(user_doc.get("_id")) or str(u_id) == str(user_id):
+                                    continue
+                                    
                                 if user_data.get("expo_push_token"):
                                     send_expo_push(user_data["expo_push_token"], "🚨 DISTRESS NEARBY", "Tap to help!", {
                                         "type": "NEARBY_SOS", 

@@ -12,6 +12,10 @@ from .models import RakshakProfile
 import logging
 from datetime import datetime
 from bson.objectid import ObjectId
+import speech_recognition as sr
+import io
+import imageio_ffmpeg
+import subprocess
 
 logger = logging.getLogger('django')
 
@@ -41,6 +45,7 @@ class RegisterView(APIView):
             "password": hashed,
             "name": name,
             "biometric_vector": data.get('biometric_vector'), # 128-dim Faceprint
+            "safety_keyword": data.get('safety_keyword', 'emergency'),
             "expo_push_token": None,
             "location": None
         }
@@ -62,7 +67,12 @@ class RegisterView(APIView):
             profile, p_created = RakshakProfile.objects.get_or_create(user=django_user)
             if p_created or not profile.rakshak_id:
                 profile.rakshak_id = generate_rakshak_id()
-                profile.save()
+            
+            # Sync safety_keyword
+            if data.get('safety_keyword'):
+                profile.safety_keyword = data.get('safety_keyword')
+            
+            profile.save()
                 
             rakshak_id = profile.rakshak_id
             users_col.update_one({"_id": ObjectId(user_id)}, {"$set": {"rakshak_id": rakshak_id}})
@@ -145,6 +155,16 @@ class ProfileView(APIView):
             return Response({"error": "User not found in custom database"}, status=status.HTTP_404_NOT_FOUND)
             
         user_doc["_id"] = str(user_doc["_id"])
+        
+        # Ensure safety_keyword is present even if not in MongoDB
+        if "safety_keyword" not in user_doc:
+            try:
+                django_user = User.objects.get(email=user_email)
+                profile = django_user.rakshak_profile
+                user_doc["safety_keyword"] = profile.safety_keyword or "emergency"
+            except Exception:
+                user_doc["safety_keyword"] = "emergency"
+                
         return Response(user_doc, status=status.HTTP_200_OK)
         
     def put(self, request):
@@ -157,6 +177,7 @@ class ProfileView(APIView):
         if 'expo_push_token' in data: update_fields['expo_push_token'] = data['expo_push_token']
         if 'location' in data: update_fields['location'] = data['location']
         if 'biometric_vector' in data: update_fields['biometric_vector'] = data['biometric_vector']
+        if 'safety_keyword' in data: update_fields['safety_keyword'] = data['safety_keyword']
         
         if not update_fields:
             return Response({"error": "No update fields provided"}, status=status.HTTP_400_BAD_REQUEST)
@@ -164,6 +185,16 @@ class ProfileView(APIView):
         result = users_col.update_one({"email": user_email}, {"$set": update_fields})
         if result.matched_count == 0:
             return Response({"error": "Failed to locate user identity record"}, status=status.HTTP_404_NOT_FOUND)
+            
+        # Sync safety_keyword to Django Profile if updated
+        if 'safety_keyword' in update_fields:
+            try:
+                django_user = User.objects.get(email=user_email)
+                profile = django_user.rakshak_profile
+                profile.safety_keyword = update_fields['safety_keyword']
+                profile.save()
+            except Exception as e:
+                logger.error(f"Sync error for safety_keyword: {e}")
             
         return Response({"message": "Profile updated successfully"}, status=status.HTTP_200_OK)
 
@@ -186,3 +217,159 @@ class UpdateLocationView(APIView):
         )
 
         return Response({"message": "Location synchronized"}, status=status.HTTP_200_OK)
+
+
+class VoiceAnalysisView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        audio_file = request.FILES.get('audio')
+        if not audio_file:
+            return Response({"error": "No audio file provided"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get user's safety keyword from Django profile
+        try:
+            user_email = request.user.email
+            django_user = User.objects.get(email=user_email)
+            profile = django_user.rakshak_profile
+            safety_keyword = (profile.safety_keyword or "emergency").lower().strip()
+        except Exception:
+            safety_keyword = "emergency"
+
+        r = sr.Recognizer()
+        
+        try:
+            # --- CONVERSION (Subprocess to bypass missing ffprobe) ---
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            
+            raw_audio = audio_file.read()
+            process = subprocess.Popen(
+                [ffmpeg_path, '-i', 'pipe:0', '-f', 'wav', 'pipe:1'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            wav_data, err = process.communicate(input=raw_audio)
+            
+            if process.returncode != 0:
+                logger.error(f"FFmpeg conversion failed: {err.decode('utf-8', errors='ignore')}")
+                return Response({"error": "Audio conversion failed"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+            wav_io = io.BytesIO(wav_data)
+
+            with sr.AudioFile(wav_io) as source:
+                # Calibrate noise floor for the first 0.2s of the chunk for robust detection
+                r.adjust_for_ambient_noise(source, duration=0.2)
+                audio_data = r.record(source)
+            
+            import string
+            import difflib
+            
+            # Use Google Speech Recognition (requires internet)
+            detected_phrase = r.recognize_google(audio_data, language="en-in").lower().strip()
+            
+            # Normalize for better accuracy
+            clean_detected = detected_phrase.translate(str.maketrans('', '', string.punctuation))
+            clean_keyword = safety_keyword.translate(str.maketrans('', '', string.punctuation))
+            
+            # --- INTELLIGENCE MODULE ---
+            DISTRESS_TERMS = ["help", "bachao", "emergency", "danger", "save me", "police"]
+            active_keywords = [clean_keyword] + DISTRESS_TERMS
+            
+            is_triggered = False
+            best_match_word = ""
+
+            # 1. Substring Exact Check (handles full phrase matches like "please save me")
+            for keyword in active_keywords:
+                if keyword in clean_detected:
+                    is_triggered = True
+                    break
+            
+            # 2. Fuzzy Matching Engine (Threshold 80%) for misinterpretations
+            if not is_triggered:
+                detected_words = clean_detected.split()
+                for word in detected_words:
+                    for keyword in active_keywords:
+                        ratio = difflib.SequenceMatcher(None, word, keyword).ratio()
+                        if ratio >= 0.8:
+                            is_triggered = True
+                            best_match_word = keyword
+                            break
+                    if is_triggered:
+                        break
+            
+            logger.info(f"Voice SOS Check: Target_Keywords='{active_keywords}', Detected='{clean_detected}', Triggered={is_triggered}")
+
+            return Response({
+                "status": "EMERGENCY_TRIGGERED" if is_triggered else "SECURE",
+                "user_keyword": safety_keyword,
+                "detected_phrase": detected_phrase,
+                "confidence": 0.95 if is_triggered else 0.0,
+                "action": "SEND_TO_AUTHORITY_WEB" if is_triggered else "NONE"
+            }, status=status.HTTP_200_OK)
+
+        except sr.UnknownValueError:
+            return Response({"status": "SECURE", "detected_phrase": "[Inaudible]", "error": "Could not understand audio"}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"Voice Analysis Error: {e}")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class VoiceEnrollView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        audio_file = request.FILES.get('audio')
+        if not audio_file:
+            return Response({"error": "No audio file provided"}, status=status.HTTP_400_BAD_REQUEST)
+
+        r = sr.Recognizer()
+        
+        try:
+            # --- CONVERSION (Subprocess to bypass missing ffprobe) ---
+            import subprocess
+            import imageio_ffmpeg
+            import io
+            import string
+            from django.contrib.auth.models import User
+            
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            
+            raw_audio = audio_file.read()
+            process = subprocess.Popen(
+                [ffmpeg_path, '-i', 'pipe:0', '-f', 'wav', 'pipe:1'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            wav_data, err = process.communicate(input=raw_audio)
+            
+            if process.returncode != 0:
+                return Response({"error": "Audio conversion failed"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+            wav_io = io.BytesIO(wav_data)
+
+            with sr.AudioFile(wav_io) as source:
+                r.adjust_for_ambient_noise(source, duration=0.2)
+                audio_data = r.record(source)
+            
+            # Transcription
+            detected_phrase = r.recognize_google(audio_data, language="en-in").lower().strip()
+            clean_phrase = detected_phrase.translate(str.maketrans('', '', string.punctuation))
+            
+            # The first word or exact normalized phrase
+            new_keyword = clean_phrase
+            
+            # Update Profile
+            user_email = request.user.email
+            django_user = User.objects.get(email=user_email)
+            profile = django_user.rakshak_profile
+            profile.safety_keyword = new_keyword
+            profile.save()
+                
+            return Response({"message": "Keyword registered successfully", "keyword": new_keyword}, status=status.HTTP_200_OK)
+
+        except sr.UnknownValueError:
+            return Response({"error": "Could not understand audio. Please speak clearly."}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Enrollment Analysis Error: {e}")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

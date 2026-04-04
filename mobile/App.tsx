@@ -18,7 +18,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 
 
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { Audio } from 'expo-av';
+import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
 import axios from 'axios';
 import * as Notifications from 'expo-notifications';
 import Constants from 'expo-constants';
@@ -604,37 +604,64 @@ export default function App() {
     loadModels();
   }, []);
 
+  // --- KEYWORD DETECTION ENGINE ("THE EAR") ---
   useEffect(() => {
-    let detectionInterval: NodeJS.Timeout;
-    if (currentScreen === 'home' && !isAlertActive && keywordModel.current) {
-      detectionInterval = setInterval(async () => {
+    let isMonitoring = true;
+
+    const startEarLoop = async () => {
+      while (isMonitoring && currentScreen === 'home' && !isAlertActive && authToken && authToken !== 'MOCK_DEMO_TOKEN') {
         try {
-          // 1. Simulate fetching current audio buffer
-          const mockBuffer = {}; // This would be the raw PCM from expo-av
-          const mfccArray = await extractMFCCs(mockBuffer);
-          
-          // 2. Perform Keyword Inference
-          if (!keywordModel.current) return;
-          const output = await keywordModel.current.run([mfccArray]);
-          const voiceScore = output[0][1]; // Probability of keyword match
+          const { status } = await Audio.requestPermissionsAsync();
+          if (status !== 'granted') break;
 
-          // 3. Perform Motion Inference (simulated here)
-          const motionScore = 0.1; // Placeholder for motion model
-          
-          const probability = fuseDetectionScores(voiceScore, motionScore);
+          await Audio.setAudioModeAsync({
+            allowsRecordingIOS: true,
+            playsInSilentModeIOS: true,
+            staysActiveInBackground: true,
+            shouldDuckAndroid: true,
+            interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
+            interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+          });
 
-          if (probability > 0.85) {
-             console.warn(" KEYWORD DETECTED. Starting Countdown...");
-             setIsSOSCountdown(true);
-             AsyncStorage.setItem('RAKSHAK_ACTIVE_SOS', 'true');
+          const { recording: earRec } = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+
+          // 3.0s burst for intelligent processing
+          await new Promise(r => setTimeout(r, 3000));
+
+          await earRec.stopAndUnloadAsync();
+          const uri = earRec.getURI();
+
+          // Offload network request asynchronously to PREVENT any blind spots in audio recording!
+          if (uri) {
+            const formData = new FormData();
+            formData.append('audio', { uri, name: 'sos_sample.m4a', type: 'audio/m4a' } as any);
+            
+            axios.post(`${API_BASE}/profile/voice-analysis/`, formData, {
+              headers: { 'Content-Type': 'multipart/form-data', Authorization: `Bearer ${authToken}` }
+            }).then(res => {
+              if (res.data.status === 'EMERGENCY_TRIGGERED') {
+                 console.warn(" 🚨 RAKSHAK: SOS KEYWORD IDENTIFIED");
+                 setIsSOSCountdown(true);
+                 AsyncStorage.setItem('RAKSHAK_ACTIVE_SOS', 'true');
+              } else {
+                 console.log(` [THE EAR] Safe. Detected: ${res.data.detected_phrase}`);
+              }
+            }).catch(e => {
+               // Silent drop for normal packet loss
+            });
           }
         } catch (e) {
-          // Silent catch for periodic loop
+          await new Promise(r => setTimeout(r, 1000)); // sleep on error to prevent CPU spin
         }
-      }, 2000); // Check every 2 seconds
+      }
+    };
+
+    if (currentScreen === 'home' && !isAlertActive && authToken) {
+      console.log(" [THE EAR] Continuous Audio Engine Armed.");
+      startEarLoop(); 
     }
-    return () => clearInterval(detectionInterval);
-  }, [currentScreen, isAlertActive, keywordModel.current]);
+    return () => { isMonitoring = false; };
+  }, [currentScreen, isAlertActive, authToken]);
 
   const autoEscalate = async () => {
     // Legacy support redirect - perform all stages instantly
@@ -819,9 +846,28 @@ export default function App() {
             const uri = recording.current.getURI();
             console.log(" Signature captured at:", uri);
             recording.current = null;
+            
+            // --- TRANSCRIBE AND ENROLL KEYWORD ON BACKEND ---
+            try {
+              console.log(" Extracting safety keyword via backend engine...");
+              const formData = new FormData();
+              formData.append('audio', { uri, name: 'enroll_sample.m4a', type: 'audio/m4a' } as any);
+              
+              const res = await axios.post(`${API_BASE}/profile/voice-enroll/`, formData, {
+                 headers: { 'Content-Type': 'multipart/form-data', Authorization: `Bearer ${authToken}` }
+              });
+              
+              setForm({...form, keyword: res.data.keyword});
+
+              Alert.alert("Voice Signature Active", `I heard "${res.data.keyword}". This is now your secure SOS trigger.`, [
+                { text: "Proceed", onPress: () => navigate('contacts_setup') }
+              ]);
+            } catch (err: any) {
+              const msg = err.response?.data?.error || "Could not analyze audio. Try again.";
+              console.error("Keyword enrollment failed", err);
+              Alert.alert("Enrollment Failed", msg);
+            }
           }
-          
-          Alert.alert("Biometric Locked", `Phrase "${form.keyword}" mapped using TFLite.`, [{ text: "Proceed", onPress: () => navigate('contacts_setup') }]);
         }, 3000);
       } catch (e) {
         console.error("Recording failed", e);
@@ -977,17 +1023,18 @@ export default function App() {
           <Text style={styles.header}>Voice Signature</Text>
           <Text style={styles.description}>Your distress keyword is processed strictly on-device using quantized TFLite models.</Text>
           
-          <InputField 
-            icon="waveform" placeholder="Secret Keyword (e.g. Help)" 
-            value={form.keyword} onChangeText={(v: string) => setForm({...form, keyword: v})}
-          />
+          <View style={[styles.infoBox, { marginBottom: 20 }]}>
+             <Text style={styles.infoText}>
+                {form.keyword ? `Your verified keyword is: "${form.keyword}"` : "Tap the microphone and speak your secret keyword."}
+             </Text>
+          </View>
 
           <View style={styles.micCircleContainer}>
             {isRecording && <Animated.View style={[styles.micPulse, { opacity: micWave.interpolate({ inputRange: [0, 1], outputRange: [0.6, 0] }), transform: [{ scale: micWave.interpolate({ inputRange: [0, 1], outputRange: [1, 1.8] }) }] }]} />}
             <TouchableOpacity 
               style={[styles.micBtn, isRecording && styles.micBtnActive]} 
               onPress={handleMicPress}
-              disabled={!form.keyword || isRecording}
+              disabled={isRecording}
             >
               <MaterialCommunityIcons name="microphone" color={THEME.text} size={35} />
             </TouchableOpacity>
@@ -1463,5 +1510,20 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 5,
     elevation: 5
+  },
+  infoBox: {
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    padding: 15,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    width: '100%',
+    alignItems: 'center'
+  },
+  infoText: {
+    color: '#CCC',
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20
   }
 });

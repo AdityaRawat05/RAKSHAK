@@ -8,6 +8,7 @@ class RakshakProfile(models.Model):
     rakshak_id = models.CharField(max_length=15, unique=True, db_index=True)
     trust_score = models.IntegerField(default=50)
     face_signature_hash = models.TextField(blank=True, null=True)
+    safety_keyword = models.CharField(max_length=50, default='emergency', blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def get_trust_tier(self):
