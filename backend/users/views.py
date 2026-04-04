@@ -237,6 +237,7 @@ class VoiceAnalysisView(APIView):
             safety_keyword = "emergency"
 
         r = sr.Recognizer()
+        r.energy_threshold = 300 # Prevent background hum triggers
         
         try:
             # --- CONVERSION (Subprocess to bypass missing ffprobe) ---
@@ -258,54 +259,60 @@ class VoiceAnalysisView(APIView):
             wav_io = io.BytesIO(wav_data)
 
             with sr.AudioFile(wav_io) as source:
-                # Calibrate noise floor for the first 0.2s of the chunk for robust detection
+                # Optimized calibrate for short chunks
                 r.adjust_for_ambient_noise(source, duration=0.2)
                 audio_data = r.record(source)
             
             import string
-            import difflib
-            
+            from difflib import SequenceMatcher
+
+            def similarity(a, b):
+                return SequenceMatcher(None, a, b).ratio()
+
             # Use Google Speech Recognition (requires internet)
             detected_phrase = r.recognize_google(audio_data, language="en-in").lower().strip()
             
-            # Normalize for better accuracy
+            # --- PERFECTED SOS LOGIC (USER SUGGESTED) ---
             clean_detected = detected_phrase.translate(str.maketrans('', '', string.punctuation))
             clean_keyword = safety_keyword.translate(str.maketrans('', '', string.punctuation))
             
-            # --- INTELLIGENCE MODULE ---
             DISTRESS_TERMS = ["help", "bachao", "emergency", "danger", "save me", "police"]
             active_keywords = [clean_keyword] + DISTRESS_TERMS
             
             is_triggered = False
-            best_match_word = ""
+            max_fuzzy_score = 0
+            match_type = "None"
 
-            # 1. Substring Exact Check (handles full phrase matches like "please save me")
-            for keyword in active_keywords:
-                if keyword in clean_detected:
+            # 1. Exact Substring Match
+            for kw in active_keywords:
+                if kw in clean_detected:
                     is_triggered = True
+                    match_type = "Direct"
                     break
             
-            # 2. Fuzzy Matching Engine (Threshold 80%) for misinterpretations
+            # 2. Fuzzy Matching Engine (Checks if any word sounds like active keywords)
             if not is_triggered:
                 detected_words = clean_detected.split()
                 for word in detected_words:
-                    for keyword in active_keywords:
-                        ratio = difflib.SequenceMatcher(None, word, keyword).ratio()
-                        if ratio >= 0.8:
+                    for kw in active_keywords:
+                        score = similarity(kw, word)
+                        if score > max_fuzzy_score:
+                            max_fuzzy_score = score
+                        if score > 0.8: # User's specified threshold
                             is_triggered = True
-                            best_match_word = keyword
+                            match_type = "Fuzzy"
                             break
                     if is_triggered:
                         break
             
-            logger.info(f"Voice SOS Check: Target_Keywords='{active_keywords}', Detected='{clean_detected}', Triggered={is_triggered}")
+            logger.info(f"Voice SOS Analysis: Detected='{detected_phrase}', Triggered={is_triggered} (Type: {match_type})")
 
             return Response({
                 "status": "EMERGENCY_TRIGGERED" if is_triggered else "SECURE",
                 "user_keyword": safety_keyword,
                 "detected_phrase": detected_phrase,
-                "confidence": 0.95 if is_triggered else 0.0,
-                "action": "SEND_TO_AUTHORITY_WEB" if is_triggered else "NONE"
+                "confidence_score": round(max(0.95 if is_triggered and match_type == "Direct" else max_fuzzy_score, 0), 2),
+                "match_type": match_type
             }, status=status.HTTP_200_OK)
 
         except sr.UnknownValueError:
@@ -323,9 +330,10 @@ class VoiceEnrollView(APIView):
             return Response({"error": "No audio file provided"}, status=status.HTTP_400_BAD_REQUEST)
 
         r = sr.Recognizer()
+        r.energy_threshold = 300
         
         try:
-            # --- CONVERSION (Subprocess to bypass missing ffprobe) ---
+            # --- CONVERSION ---
             import subprocess
             import imageio_ffmpeg
             import io
@@ -349,14 +357,14 @@ class VoiceEnrollView(APIView):
             wav_io = io.BytesIO(wav_data)
 
             with sr.AudioFile(wav_io) as source:
-                r.adjust_for_ambient_noise(source, duration=0.2)
+                # Use 0.5s for enrollment to allow user to stabilize
+                r.adjust_for_ambient_noise(source, duration=0.5)
                 audio_data = r.record(source)
             
-            # Transcription
+            # Transcription (Perfected logic)
             detected_phrase = r.recognize_google(audio_data, language="en-in").lower().strip()
             clean_phrase = detected_phrase.translate(str.maketrans('', '', string.punctuation))
             
-            # The first word or exact normalized phrase
             new_keyword = clean_phrase
             
             # Update Profile
@@ -365,8 +373,14 @@ class VoiceEnrollView(APIView):
             profile = django_user.rakshak_profile
             profile.safety_keyword = new_keyword
             profile.save()
+            
+            logger.info(f"✅ RAKSHAK: Voice Enrollment Success - Keyword Armed: '{new_keyword}'")
                 
-            return Response({"message": "Keyword registered successfully", "keyword": new_keyword}, status=status.HTTP_200_OK)
+            return Response({
+                "message": "Keyword registered successfully", 
+                "keyword": new_keyword,
+                "status": "ARMED"
+            }, status=status.HTTP_200_OK)
 
         except sr.UnknownValueError:
             return Response({"error": "Could not understand audio. Please speak clearly."}, status=status.HTTP_400_BAD_REQUEST)
